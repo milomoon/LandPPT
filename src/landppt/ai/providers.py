@@ -6,28 +6,221 @@ import asyncio
 import json
 import logging
 import re
+import hashlib
+import threading
+import uuid
+from importlib.metadata import PackageNotFoundError, version as package_version
+from urllib.parse import urlparse
+from collections import OrderedDict
 from typing import List, Dict, Any, Optional, AsyncGenerator, Union, Tuple
 
 from .base import AIProvider, AIMessage, AIResponse, MessageRole, TextContent, ImageContent, MessageContentType
-from ..core.config import ai_config
+from ..core.config import ai_config, resolve_timeout_seconds
 
 logger = logging.getLogger(__name__)
+
+
+def build_opencode_session_headers(
+    base_url: Optional[str],
+    conversation_id: Optional[str],
+) -> Dict[str, str]:
+    """Build OpenCode Go's session header without affecting other providers."""
+    session_id = str(conversation_id or "").strip()
+    if not session_id or len(session_id) > 256 or any(char in session_id for char in "\r\n"):
+        return {}
+
+    try:
+        parsed = urlparse(str(base_url or "").strip())
+    except ValueError:
+        return {}
+
+    hostname = (parsed.hostname or "").lower().rstrip(".")
+    path = (parsed.path or "").rstrip("/")
+    if parsed.scheme not in {"http", "https"} or hostname != "opencode.ai":
+        return {}
+    if path != "/zen/go" and not path.startswith("/zen/go/"):
+        return {}
+
+    return {"x-opencode-session": session_id}
+
+
+def build_opencode_client_headers(base_url: Optional[str]) -> Dict[str, str]:
+    """Identify LandPPT honestly on OpenCode Go without changing other providers."""
+    if not build_opencode_session_headers(base_url, "landppt-client-check"):
+        return {}
+    try:
+        client_version = package_version("landppt")
+    except PackageNotFoundError:
+        client_version = "unknown"
+    return {"User-Agent": f"LandPPT/{client_version}"}
+
+
+def build_opencode_test_session_headers(base_url: Optional[str]) -> Dict[str, str]:
+    """Create a fresh session for one provider connectivity-test lifecycle."""
+    return build_opencode_session_headers(base_url, uuid.uuid4().hex)
+
+def _get_llm_timeout_seconds(config: Dict[str, Any], *, default_seconds: float = 600.0) -> float:
+    raw_timeout = config.get("llm_timeout_seconds")
+    if raw_timeout is not None:
+        return float(resolve_timeout_seconds(raw_timeout, int(default_seconds)))
+
+    for key in ("http_timeout_seconds", "request_timeout_seconds", "timeout_seconds", "http_timeout", "timeout"):
+        value = config.get(key)
+        if value is None:
+            continue
+        try:
+            seconds = float(value)
+            if seconds > 0:
+                return seconds
+        except Exception:
+            continue
+    return float(resolve_timeout_seconds(None, int(default_seconds)))
+
+
+def _get_httpx_timeout_seconds(config: Dict[str, Any], *, default_seconds: float = 600.0) -> float:
+    """
+    Get per-request HTTP timeout for OpenAI-compatible SDKs (which use httpx under the hood).
+
+    Notes:
+    - This is the *client-side* timeout. If the upstream gateway returns 504, increasing this
+      won't override the gateway's own timeout, but it avoids local read timeouts for slower models.
+    """
+    return _get_llm_timeout_seconds(config, default_seconds=default_seconds)
+
+
+def _build_aiohttp_timeout(config: Dict[str, Any], *, default_seconds: float = 600.0):
+    try:
+        import aiohttp
+    except Exception:
+        return None
+
+    total = _get_llm_timeout_seconds(config, default_seconds=default_seconds)
+    return aiohttp.ClientTimeout(total=total)
+
+
+def _build_httpx_timeout(config: Dict[str, Any]):
+    try:
+        import httpx
+    except Exception:
+        return None
+
+    total = _get_httpx_timeout_seconds(config, default_seconds=600.0)
+    connect = min(30.0, total)
+    write = min(30.0, total)
+    pool = min(30.0, total)
+    return httpx.Timeout(total, connect=connect, read=total, write=write, pool=pool)
+
+
+# Reasoning / "think" block markers emitted by some models (DeepSeek-R1, QwQ, etc.).
+# Covers <think>/<thinking>, full-width ＜think＞ and bracket 【think】 variants, with
+# optional attributes on the opening tag.
+_THINK_BLOCK_RE = re.compile(
+    r'[<＜【]\s*think(?:ing)?[^>＞】]*[>＞】][\s\S]*?[<＜【]\s*/\s*think(?:ing)?\s*[>＞】]',
+    re.IGNORECASE,
+)
+_THINK_OPEN_RE = re.compile(r'[<＜【]\s*think(?:ing)?[^>＞】]*[>＞】]', re.IGNORECASE)
+_THINK_LONE_CLOSE_RE = re.compile(
+    r'^[\s\S]*?[<＜【]\s*/\s*think(?:ing)?\s*[>＞】]', re.IGNORECASE
+)
+
+
+def strip_think_content(content: str) -> str:
+    """Remove model reasoning/think blocks so internal reasoning never reaches the user.
+
+    Handles well-formed <think>...</think> blocks (plus <thinking>, full-width ＜think＞
+    and bracket 【think】 variants), and the common case where a gateway strips the
+    opening tag but leaves the reasoning followed by a lone closing tag.
+    """
+    if not content:
+        return content
+
+    cleaned = _THINK_BLOCK_RE.sub('', content)
+
+    # Opening tag was stripped upstream but reasoning + lone "</think>" remain before the
+    # real answer: drop everything up to and including that closing tag.
+    if not _THINK_OPEN_RE.search(cleaned):
+        cleaned = _THINK_LONE_CLOSE_RE.sub('', cleaned, count=1)
+
+    return cleaned.strip()
 
 
 class OpenAIProvider(AIProvider):
     """OpenAI API provider"""
 
+    SUPPORTED_REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
+
     def __init__(self, config: Dict[str, Any]):
         super().__init__(config)
+        self.use_responses_api = self._coerce_bool(config.get("use_responses_api"))
+        self.enable_reasoning = self._coerce_bool(config.get("enable_reasoning"))
+        self.reasoning_effort = self._normalize_reasoning_effort(config.get("reasoning_effort")) or "medium"
         try:
             import openai
-            self.client = openai.AsyncOpenAI(
-                api_key=config.get("api_key"),
-                base_url=config.get("base_url")
-            )
+            timeout = _build_httpx_timeout(config)
+            client_kwargs = {
+                "api_key": config.get("api_key"),
+                "base_url": config.get("base_url"),
+                "timeout": timeout,
+            }
+            client_headers = build_opencode_client_headers(config.get("base_url"))
+            if client_headers:
+                client_kwargs["default_headers"] = client_headers
+            try:
+                self.client = openai.AsyncOpenAI(**client_kwargs)
+            except TypeError:
+                client_kwargs.pop("timeout", None)
+                try:
+                    self.client = openai.AsyncOpenAI(**client_kwargs)
+                except TypeError:
+                    client_kwargs.pop("default_headers", None)
+                    self.client = openai.AsyncOpenAI(**client_kwargs)
         except ImportError:
             logger.warning("OpenAI library not installed. Install with: pip install openai")
             self.client = None
+
+    @staticmethod
+    def _coerce_bool(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return False
+        return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+    def _should_use_responses_api(self, config: Dict[str, Any]) -> bool:
+        return self._coerce_bool(config.get("use_responses_api", self.use_responses_api))
+
+    @classmethod
+    def _normalize_reasoning_effort(cls, value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        normalized = str(value).strip().lower()
+        return normalized if normalized in cls.SUPPORTED_REASONING_EFFORTS else None
+
+    def _should_enable_reasoning(self, config: Dict[str, Any]) -> bool:
+        return self._coerce_bool(config.get("enable_reasoning", self.enable_reasoning))
+
+    def _get_reasoning_effort(self, config: Dict[str, Any]) -> str:
+        return (
+            self._normalize_reasoning_effort(config.get("reasoning_effort"))
+            or self.reasoning_effort
+            or "medium"
+        )
+
+    def _apply_reasoning_config(
+        self,
+        request_kwargs: Dict[str, Any],
+        config: Dict[str, Any],
+        *,
+        responses_api: bool,
+    ) -> None:
+        if not self._should_enable_reasoning(config):
+            return
+
+        reasoning_effort = self._get_reasoning_effort(config)
+        if responses_api:
+            request_kwargs["reasoning"] = {"effort": reasoning_effort}
+        else:
+            request_kwargs["reasoning_effort"] = reasoning_effort
 
     def _convert_message_to_openai(self, message: AIMessage) -> Dict[str, Any]:
         """Convert AIMessage to OpenAI format, supporting multimodal content"""
@@ -57,43 +250,285 @@ class OpenAIProvider(AIProvider):
 
         if message.name:
             openai_message["name"] = message.name
+        if message.tool_call_id:
+            openai_message["tool_call_id"] = message.tool_call_id
+        if message.tool_calls:
+            openai_message["tool_calls"] = message.tool_calls
 
         return openai_message
 
+    def _convert_message_to_responses_input(self, message: AIMessage) -> Dict[str, Any]:
+        """Convert AIMessage to OpenAI Responses API input format."""
+        responses_message: Dict[str, Any] = {"role": message.role.value}
+
+        if isinstance(message.content, str):
+            responses_message["content"] = message.content
+            return responses_message
+
+        if isinstance(message.content, list):
+            content_parts = []
+            for part in message.content:
+                if isinstance(part, TextContent):
+                    content_parts.append({
+                        "type": "input_text",
+                        "text": part.text,
+                    })
+                elif isinstance(part, ImageContent):
+                    image_url = part.image_url.get("url") if isinstance(part.image_url, dict) else None
+                    if image_url:
+                        content_parts.append({
+                            "type": "input_image",
+                            "image_url": image_url,
+                            "detail": "auto",
+                        })
+            responses_message["content"] = content_parts or str(message.content)
+            return responses_message
+
+        responses_message["content"] = str(message.content)
+        return responses_message
+
+    def _build_chat_completions_request(
+        self,
+        config: Dict[str, Any],
+        openai_messages: List[Dict[str, Any]],
+        *,
+        stream: bool = False,
+    ) -> Dict[str, Any]:
+        tools = config.pop("tools", None)
+        tool_choice = config.pop("tool_choice", None)
+        parallel_tool_calls = config.pop("parallel_tool_calls", None)
+        request_kwargs: Dict[str, Any] = {
+            "model": config.get("model", self.model),
+            "messages": openai_messages,
+            "temperature": config.get("temperature", 0.7),
+            "top_p": config.get("top_p", 1.0),
+        }
+        if stream:
+            request_kwargs["stream"] = True
+        if tools:
+            request_kwargs["tools"] = tools
+        if tool_choice is not None:
+            request_kwargs["tool_choice"] = tool_choice
+        if parallel_tool_calls is not None:
+            request_kwargs["parallel_tool_calls"] = parallel_tool_calls
+
+        self._apply_reasoning_config(request_kwargs, config, responses_api=False)
+
+        from ..services.runtime.ai_execution import get_current_ai_conversation_id
+        extra_headers = build_opencode_session_headers(
+            config.get("base_url"),
+            config.get("conversation_id") or get_current_ai_conversation_id(),
+        )
+        if extra_headers:
+            request_kwargs["extra_headers"] = extra_headers
+
+        return request_kwargs
+
+    def _extract_openai_tool_calls(self, message: Any) -> List[Dict[str, Any]]:
+        tool_calls = getattr(message, "tool_calls", None) or []
+        normalized: List[Dict[str, Any]] = []
+        for call in tool_calls:
+            function = getattr(call, "function", None)
+            normalized.append(
+                {
+                    "id": getattr(call, "id", None) or "",
+                    "type": getattr(call, "type", None) or "function",
+                    "function": {
+                        "name": getattr(function, "name", None) or "",
+                        "arguments": getattr(function, "arguments", None) or "{}",
+                    },
+                }
+            )
+        return normalized
+
+    def _build_responses_request(
+        self,
+        config: Dict[str, Any],
+        responses_input: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        request_kwargs: Dict[str, Any] = {
+            "model": config.get("model", self.model),
+            "input": responses_input,
+            "temperature": config.get("temperature", 0.7),
+            "top_p": config.get("top_p", 1.0),
+        }
+
+        self._apply_reasoning_config(request_kwargs, config, responses_api=True)
+
+        from ..services.runtime.ai_execution import get_current_ai_conversation_id
+        extra_headers = build_opencode_session_headers(
+            config.get("base_url"),
+            config.get("conversation_id") or get_current_ai_conversation_id(),
+        )
+        if extra_headers:
+            request_kwargs["extra_headers"] = extra_headers
+
+        return request_kwargs
+
+    @staticmethod
+    def _extract_usage(usage: Any, *, prompt_key: str, completion_key: str, total_key: str) -> Dict[str, int]:
+        return {
+            "prompt_tokens": int(getattr(usage, prompt_key, 0) or 0),
+            "completion_tokens": int(getattr(usage, completion_key, 0) or 0),
+            "total_tokens": int(getattr(usage, total_key, 0) or 0),
+        }
+
+    @staticmethod
+    def _find_first_match(text: str, markers: Tuple[str, ...]) -> Optional[Tuple[int, str]]:
+        matches = []
+        lowered = text.lower()
+        for marker in markers:
+            pos = lowered.find(marker.lower())
+            if pos != -1:
+                matches.append((pos, marker))
+        if not matches:
+            return None
+        return min(matches, key=lambda item: item[0])
+
+    @staticmethod
+    def _longest_partial_marker_suffix(text: str, markers: Tuple[str, ...]) -> int:
+        """Length of the trailing text that could still grow into a marker.
+
+        Streaming chunks split anywhere, so a buffer ending in ``"...<thi"`` must be
+        held back rather than emitted or discarded.
+        """
+        lowered = text.lower()
+        longest = 0
+        for marker in markers:
+            marker_lower = marker.lower()
+            # Try the longest prefix of the marker that the text ends with.
+            for length in range(min(len(marker_lower) - 1, len(lowered)), 0, -1):
+                if lowered.endswith(marker_lower[:length]):
+                    longest = max(longest, length)
+                    break
+        return longest
+
+    async def _filter_think_chunks(self, chunks: AsyncGenerator[str, None]) -> AsyncGenerator[str, None]:
+        """Strip <think> blocks from a stream without losing or leaking content.
+
+        Markers are matched across chunk boundaries: a split ``</think>`` used to
+        leave ``in_think_tag`` permanently true and silently swallow the rest of the
+        response, and text preceding a ``<think>`` in the same chunk was dropped.
+        """
+        buffer = ""
+        in_think_tag = False
+        open_markers = ("<think", "＜think")
+        close_markers = ("</think>", "＜/think＞")
+
+        async for chunk_content in chunks:
+            if not chunk_content:
+                continue
+
+            buffer += chunk_content
+            emit = ""
+
+            while buffer:
+                if not in_think_tag:
+                    match = self._find_first_match(buffer, open_markers)
+                    if match is None:
+                        # Keep back anything that might be the start of a marker.
+                        hold = self._longest_partial_marker_suffix(buffer, open_markers)
+                        if hold:
+                            emit += buffer[:-hold]
+                            buffer = buffer[-hold:]
+                        else:
+                            emit += buffer
+                            buffer = ""
+                        break
+
+                    think_start, _ = match
+                    emit += buffer[:think_start]
+                    candidate = buffer[think_start:]
+
+                    # Wait for the tag to actually close before skipping it: the
+                    # opening tag itself may be split across chunks.
+                    tag_end_candidates = [candidate.find(">"), candidate.find("＞")]
+                    tag_end_candidates = [idx for idx in tag_end_candidates if idx != -1]
+                    if not tag_end_candidates:
+                        buffer = candidate
+                        break
+
+                    in_think_tag = True
+                    buffer = candidate[min(tag_end_candidates) + 1:]
+                else:
+                    match = self._find_first_match(buffer, close_markers)
+                    if match is None:
+                        # Discard reasoning text, but retain a possible partial
+                        # closing marker so the next chunk can complete it.
+                        hold = self._longest_partial_marker_suffix(buffer, close_markers)
+                        buffer = buffer[-hold:] if hold else ""
+                        break
+
+                    think_end, close_marker = match
+                    in_think_tag = False
+                    buffer = buffer[think_end + len(close_marker):]
+
+            if emit:
+                yield emit
+
+        # Flush anything held back that never became a marker.
+        if buffer and not in_think_tag:
+            yield buffer
+
     def _filter_think_content(self, content: str) -> str:
+        """Filter out model reasoning/think blocks before exposing output.
+
+        Delegates to the shared ``strip_think_content`` helper. Supports
+        <think>/<thinking>, full-width ＜think＞ and bracket 【think】 variants.
         """
-        Filter out content within think tags in all forms
-        Supports: <think>, <think>, ＜think＞, 【think】 and their closing tags
-        This prevents internal reasoning from being exposed in the output
-        """
-        if not content:
-            return content
+        return strip_think_content(content or "")
 
-        import re
+    async def _chat_completion_via_chat_completions(
+        self,
+        config: Dict[str, Any],
+        openai_messages: List[Dict[str, Any]],
+    ) -> AIResponse:
+        request_kwargs = self._build_chat_completions_request(config, openai_messages)
+        response = await self.client.chat.completions.create(**request_kwargs)
 
-        # Pattern to match different forms of think tags (opening and closing)
-        # Matches: <think>...</think>, <think>...</think>, ＜think＞...＜/think＞, 【think】...【/think】
-        # Also handles self-closing and nested tags
-        patterns = [
-            r'<think[\s\S]*?></think>',           # <think>...</think>
-        ]
+        choice = response.choices[0]
+        tool_calls = self._extract_openai_tool_calls(choice.message)
+        filtered_content = self._filter_think_content(choice.message.content or "")
 
-        # Apply all patterns
-        filtered_content = content
-        for pattern in patterns:
-            filtered_content = re.sub(pattern, '', filtered_content, flags=re.IGNORECASE)
+        return AIResponse(
+            content=filtered_content,
+            model=response.model,
+            usage=self._extract_usage(
+                response.usage,
+                prompt_key="prompt_tokens",
+                completion_key="completion_tokens",
+                total_key="total_tokens",
+            ),
+            finish_reason=choice.finish_reason,
+            tool_calls=tool_calls,
+            metadata={"provider": "openai", "transport": "chat_completions"},
+        )
 
-        # # Clean up any extra whitespace that might be left behind
-        # # Remove multiple consecutive empty lines
-        # filtered_content = re.sub(r'\n\s*\n\s*\n\s*\n', '', filtered_content)
+    async def _chat_completion_via_responses(
+        self,
+        config: Dict[str, Any],
+        responses_input: List[Dict[str, Any]],
+    ) -> AIResponse:
+        request_kwargs = self._build_responses_request(config, responses_input)
+        response = await self.client.responses.create(**request_kwargs)
 
-        # # Remove empty lines at the beginning and end
-        # filtered_content = filtered_content.strip()
+        incomplete_details = getattr(response, "incomplete_details", None)
+        finish_reason = getattr(incomplete_details, "reason", None)
+        if finish_reason is None and getattr(response, "status", None) == "completed":
+            finish_reason = "stop"
 
-        # # Clean up extra spaces within lines
-        # filtered_content = re.sub(r' +', ' ', filtered_content)
-
-        return filtered_content
+        return AIResponse(
+            content=self._filter_think_content(response.output_text or ""),
+            model=response.model,
+            usage=self._extract_usage(
+                getattr(response, "usage", None),
+                prompt_key="input_tokens",
+                completion_key="output_tokens",
+                total_key="total_tokens",
+            ),
+            finish_reason=finish_reason,
+            metadata={"provider": "openai", "transport": "responses"},
+        )
     
     async def chat_completion(self, messages: List[AIMessage], **kwargs) -> AIResponse:
         """Generate chat completion using OpenAI"""
@@ -101,37 +536,15 @@ class OpenAIProvider(AIProvider):
             raise RuntimeError("OpenAI client not available")
 
         config = self._merge_config(**kwargs)
-
-        # Convert messages to OpenAI format with multimodal support
-        openai_messages = [
-            self._convert_message_to_openai(msg)
-            for msg in messages
-        ]
+        use_responses_api = self._should_use_responses_api(config) and not config.get("tools")
         
         try:
-            response = await self.client.chat.completions.create(
-                model=config.get("model", self.model),
-                messages=openai_messages,
-                # max_tokens=config.get("max_tokens", 2000),
-                temperature=config.get("temperature", 0.7),
-                top_p=config.get("top_p", 1.0)
-            )
-            
-            choice = response.choices[0]
-            # Filter out think content from the response
-            filtered_content = self._filter_think_content(choice.message.content)
+            if use_responses_api:
+                responses_input = [self._convert_message_to_responses_input(msg) for msg in messages]
+                return await self._chat_completion_via_responses(config, responses_input)
 
-            return AIResponse(
-                content=filtered_content,
-                model=response.model,
-                usage={
-                    "prompt_tokens": response.usage.prompt_tokens,
-                    "completion_tokens": response.usage.completion_tokens,
-                    "total_tokens": response.usage.total_tokens
-                },
-                finish_reason=choice.finish_reason,
-                metadata={"provider": "openai"}
-            )
+            openai_messages = [self._convert_message_to_openai(msg) for msg in messages]
+            return await self._chat_completion_via_chat_completions(config, openai_messages)
             
         except Exception as e:
             # 提供更详细的错误信息
@@ -157,88 +570,34 @@ class OpenAIProvider(AIProvider):
             raise RuntimeError("OpenAI client not available")
 
         config = self._merge_config(**kwargs)
-
-        # Convert messages to OpenAI format with multimodal support
-        openai_messages = [
-            self._convert_message_to_openai(msg)
-            for msg in messages
-        ]
+        use_responses_api = self._should_use_responses_api(config)
 
         try:
-            stream = await self.client.chat.completions.create(
-                model=config.get("model", self.model),
-                messages=openai_messages,
-                # max_tokens=config.get("max_tokens", 2000),
-                temperature=config.get("temperature", 0.7),
-                top_p=config.get("top_p", 1.0),
-                stream=True
-            )
+            if use_responses_api:
+                responses_input = [self._convert_message_to_responses_input(msg) for msg in messages]
+                request_kwargs = self._build_responses_request(config, responses_input)
 
-            buffer = ""
-            in_think_tag = False
+                async def _responses_chunks() -> AsyncGenerator[str, None]:
+                    async with self.client.responses.stream(**request_kwargs) as stream:
+                        async for event in stream:
+                            if getattr(event, "type", None) == "response.output_text.delta" and getattr(event, "delta", None):
+                                yield event.delta
 
-            async for chunk in stream:
-                if chunk.choices and chunk.choices[0].delta.content:
-                    chunk_content = chunk.choices[0].delta.content
-                    buffer += chunk_content
+                async for visible_chunk in self._filter_think_chunks(_responses_chunks()):
+                    yield visible_chunk
+                return
 
-                    # Process the buffer to handle think tags
-                    processed_content = ""
-                    remaining_buffer = buffer
+            openai_messages = [self._convert_message_to_openai(msg) for msg in messages]
+            request_kwargs = self._build_chat_completions_request(config, openai_messages, stream=True)
+            stream = await self.client.chat.completions.create(**request_kwargs)
 
-                    while remaining_buffer:
-                        if not in_think_tag:
-                            # Look for opening think tag
-                            think_start = None
-                            # Check for different forms of think tags (case-insensitive)
-                            for tag in ['<think', '<think>', '＜think', '【think']:
-                                pos = remaining_buffer.lower().find(tag.lower())
-                                if pos != -1:
-                                    think_start = pos
-                                    break
+            async def _chat_completion_chunks() -> AsyncGenerator[str, None]:
+                async for chunk in stream:
+                    if chunk.choices and chunk.choices[0].delta.content:
+                        yield chunk.choices[0].delta.content
 
-                            if think_start is not None:
-                                # Found opening tag, add content before it
-                                processed_content += remaining_buffer[:think_start]
-                                in_think_tag = True
-                                # Remove everything up to and including the opening tag
-                                remaining_buffer = remaining_buffer[think_start:]
-                                # Find the end of the opening tag
-                                tag_end = remaining_buffer.lower().find('>')
-                                if tag_end != -1:
-                                    remaining_buffer = remaining_buffer[tag_end + 1:]
-                                else:
-                                    remaining_buffer = ""
-                                    break
-                            else:
-                                # No think tag found, add everything to processed content
-                                processed_content += remaining_buffer
-                                remaining_buffer = ""
-                                break
-                        else:
-                            # We're inside a think tag, look for closing tag
-                            think_end = None
-                            # Check for different forms of closing tags (case-insensitive)
-                            for tag in ['</think>', '</think>', '＜/think＞', '【/think】']:
-                                pos = remaining_buffer.lower().find(tag.lower())
-                                if pos != -1:
-                                    think_end = pos
-                                    break
-
-                            if think_end is not None:
-                                # Found closing tag, skip to after it
-                                in_think_tag = False
-                                remaining_buffer = remaining_buffer[think_end + len('</think>'):]
-                            else:
-                                # Haven't found closing tag yet, skip this chunk
-                                remaining_buffer = ""
-
-                    # Update buffer with remaining content
-                    buffer = remaining_buffer
-
-                    # Yield processed content if not in think tag
-                    if not in_think_tag and processed_content:
-                        yield processed_content
+            async for visible_chunk in self._filter_think_chunks(_chat_completion_chunks()):
+                yield visible_chunk
 
         except Exception as e:
             logger.error(f"OpenAI streaming error: {e}")
@@ -250,23 +609,126 @@ class OpenAIProvider(AIProvider):
         async for chunk in self.stream_chat_completion(messages, **kwargs):
             yield chunk
 
+
+class AzureOpenAIProvider(OpenAIProvider):
+    """Azure OpenAI provider (OpenAI Python SDK AsyncAzureOpenAI)"""
+
+    def __init__(self, config: Dict[str, Any]):
+        # Do not call OpenAIProvider.__init__ (it would create AsyncOpenAI).
+        AIProvider.__init__(self, config)
+        try:
+            import openai
+            timeout = _build_httpx_timeout(config)
+
+            try:
+                self.client = openai.AsyncAzureOpenAI(
+                    api_key=config.get("api_key"),
+                    azure_endpoint=config.get("azure_endpoint"),
+                    api_version=config.get("api_version"),
+                    timeout=timeout,
+                )
+            except TypeError:
+                self.client = openai.AsyncAzureOpenAI(
+                    api_key=config.get("api_key"),
+                    azure_endpoint=config.get("azure_endpoint"),
+                    api_version=config.get("api_version"),
+                )
+        except ImportError:
+            logger.warning("OpenAI library not installed. Install with: pip install openai")
+            self.client = None
+
+
 class AnthropicProvider(AIProvider):
     """Anthropic Claude API provider"""
 
+    SUPPORTED_REASONING_EFFORTS = {"low", "medium", "high", "xhigh", "max"}
+
     def __init__(self, config: Dict[str, Any]):
         super().__init__(config)
+        self.enable_reasoning = OpenAIProvider._coerce_bool(config.get("enable_reasoning"))
+        self.reasoning_effort = self._normalize_reasoning_effort(config.get("reasoning_effort")) or "high"
         try:
             import anthropic
-            self.client = anthropic.AsyncAnthropic(
-                api_key=config.get("api_key")
-            )
+            base_url = config.get("base_url")
+            base_url = base_url.strip() if isinstance(base_url, str) else None
+
+            timeout = _get_llm_timeout_seconds(config)
+
+            try:
+                if base_url:
+                    self.client = anthropic.AsyncAnthropic(
+                        api_key=config.get("api_key"),
+                        base_url=base_url,
+                        timeout=timeout,
+                    )
+                else:
+                    self.client = anthropic.AsyncAnthropic(
+                        api_key=config.get("api_key"),
+                        timeout=timeout,
+                    )
+            except TypeError:
+                # Backwards compatibility with older anthropic SDK versions
+                self.client = anthropic.AsyncAnthropic(api_key=config.get("api_key"))
         except ImportError:
             logger.warning("Anthropic library not installed. Install with: pip install anthropic")
             self.client = None
 
+    @classmethod
+    def _normalize_reasoning_effort(cls, value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        normalized = str(value).strip().lower()
+        return normalized if normalized in cls.SUPPORTED_REASONING_EFFORTS else None
+
+    def _apply_reasoning_config(self, request_kwargs: Dict[str, Any], config: Dict[str, Any]) -> None:
+        if not OpenAIProvider._coerce_bool(config.get("enable_reasoning", self.enable_reasoning)):
+            return
+
+        effort = (
+            self._normalize_reasoning_effort(config.get("reasoning_effort"))
+            or self.reasoning_effort
+            or "high"
+        )
+        request_kwargs["output_config"] = {"effort": effort}
+
     def _convert_message_to_anthropic(self, message: AIMessage) -> Dict[str, Any]:
         """Convert AIMessage to Anthropic format, supporting multimodal content"""
+        if message.role == MessageRole.TOOL:
+            return {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": message.tool_call_id or "",
+                        "content": message.content if isinstance(message.content, str) else str(message.content),
+                    }
+                ],
+            }
+
         anthropic_message = {"role": message.role.value}
+
+        if message.tool_calls:
+            content_parts: List[Dict[str, Any]] = []
+            if isinstance(message.content, str) and message.content:
+                content_parts.append({"type": "text", "text": message.content})
+            for call in message.tool_calls:
+                function = call.get("function") or {}
+                arguments = function.get("arguments") or {}
+                if isinstance(arguments, str):
+                    try:
+                        arguments = json.loads(arguments or "{}")
+                    except json.JSONDecodeError:
+                        arguments = {}
+                content_parts.append(
+                    {
+                        "type": "tool_use",
+                        "id": call.get("id") or "",
+                        "name": function.get("name") or "",
+                        "input": arguments if isinstance(arguments, dict) else {},
+                    }
+                )
+            anthropic_message["content"] = content_parts
+            return anthropic_message
 
         if isinstance(message.content, str):
             # Simple text message
@@ -308,45 +770,123 @@ class AnthropicProvider(AIProvider):
             anthropic_message["content"] = str(message.content)
 
         return anthropic_message
+
+    def _convert_tools_to_anthropic(self, tools: Optional[List[Dict[str, Any]]]) -> Optional[List[Dict[str, Any]]]:
+        if not tools:
+            return None
+        converted: List[Dict[str, Any]] = []
+        for tool in tools:
+            function = tool.get("function") if tool.get("type") == "function" else tool
+            if not isinstance(function, dict):
+                continue
+            converted.append(
+                {
+                    "name": function.get("name"),
+                    "description": function.get("description") or "",
+                    "input_schema": function.get("parameters") or {"type": "object", "properties": {}},
+                }
+            )
+        return converted or None
+
+    def _extract_anthropic_response(self, response: Any) -> tuple[str, List[Dict[str, Any]], str, Dict[str, int]]:
+        text_parts: List[str] = []
+        tool_calls: List[Dict[str, Any]] = []
+        for part in getattr(response, "content", None) or []:
+            part_type = getattr(part, "type", None)
+            if part_type == "text":
+                text_parts.append(getattr(part, "text", "") or "")
+            elif part_type == "tool_use":
+                tool_calls.append(
+                    {
+                        "id": getattr(part, "id", "") or "",
+                        "type": "function",
+                        "function": {
+                            "name": getattr(part, "name", "") or "",
+                            "arguments": json.dumps(getattr(part, "input", {}) or {}, ensure_ascii=False),
+                        },
+                    }
+                )
+        usage_obj = getattr(response, "usage", None)
+        input_tokens = int(getattr(usage_obj, "input_tokens", 0) or 0)
+        output_tokens = int(getattr(usage_obj, "output_tokens", 0) or 0)
+        return (
+            "".join(text_parts),
+            tool_calls,
+            str(getattr(response, "stop_reason", None) or "stop"),
+            {
+                "prompt_tokens": input_tokens,
+                "completion_tokens": output_tokens,
+                "total_tokens": input_tokens + output_tokens,
+            },
+        )
     
     async def chat_completion(self, messages: List[AIMessage], **kwargs) -> AIResponse:
-        """Generate chat completion using Anthropic Claude"""
+        """Generate chat completion using Anthropic Claude (uses streaming internally to avoid timeout)"""
         if not self.client:
             raise RuntimeError("Anthropic client not available")
 
         config = self._merge_config(**kwargs)
 
-        # Convert messages to Anthropic format
-        system_message = None
-        claude_messages = []
+        # 使用流式响应来避免 SDK 的 10 分钟超时限制
+        # 收集所有流式块后返回完整响应
+        tools = config.pop("tools", None)
+        tool_choice = config.pop("tool_choice", None)
 
-        for msg in messages:
-            if msg.role == MessageRole.SYSTEM:
-                # System messages should be simple text for Anthropic
-                system_message = msg.content if isinstance(msg.content, str) else str(msg.content)
-            else:
-                claude_messages.append(self._convert_message_to_anthropic(msg))
-        
+        if tools:
+            system_message = None
+            claude_messages = []
+            for msg in messages:
+                if msg.role == MessageRole.SYSTEM:
+                    system_message = msg.content if isinstance(msg.content, str) else str(msg.content)
+                else:
+                    claude_messages.append(self._convert_message_to_anthropic(msg))
+
+            request_kwargs: Dict[str, Any] = {
+                "model": config.get("model", self.model),
+                "messages": claude_messages,
+                "temperature": config.get("temperature", 0.7),
+                "max_tokens": int(config.get("anthropic_max_tokens") or config.get("max_completion_tokens") or 4096),
+                "tools": self._convert_tools_to_anthropic(tools),
+            }
+            if system_message:
+                request_kwargs["system"] = system_message
+            if tool_choice and isinstance(tool_choice, dict):
+                function = tool_choice.get("function") or {}
+                name = function.get("name") or tool_choice.get("name")
+                if name:
+                    request_kwargs["tool_choice"] = {"type": "tool", "name": name}
+
+            self._apply_reasoning_config(request_kwargs, config)
+
+            try:
+                response = await self.client.messages.create(**request_kwargs)
+                content, tool_calls, finish_reason, usage = self._extract_anthropic_response(response)
+                return AIResponse(
+                    content=content,
+                    model=getattr(response, "model", None) or config.get("model", self.model),
+                    usage=usage,
+                    finish_reason=finish_reason,
+                    tool_calls=tool_calls,
+                    metadata={"provider": "anthropic", "transport": "messages"},
+                )
+            except Exception as e:
+                logger.error(f"Anthropic API error: {e}")
+                raise
+
         try:
-            response = await self.client.messages.create(
-                model=config.get("model", self.model),
-                # max_tokens=config.get("max_tokens", 2000),
-                temperature=config.get("temperature", 0.7),
-                system=system_message,
-                messages=claude_messages
-            )
-            
-            content = response.content[0].text if response.content else ""
+            full_content = ""
+            async for chunk in self.stream_chat_completion(messages, **kwargs):
+                full_content += chunk
             
             return AIResponse(
-                content=content,
-                model=response.model,
+                content=full_content,
+                model=config.get("model", self.model),
                 usage={
-                    "prompt_tokens": response.usage.input_tokens,
-                    "completion_tokens": response.usage.output_tokens,
-                    "total_tokens": response.usage.input_tokens + response.usage.output_tokens
+                    "prompt_tokens": 0,  # 流式响应不提供精确的 token 统计
+                    "completion_tokens": 0,
+                    "total_tokens": 0
                 },
-                finish_reason=response.stop_reason,
+                finish_reason="stop",
                 metadata={"provider": "anthropic"}
             )
             
@@ -359,19 +899,146 @@ class AnthropicProvider(AIProvider):
         messages = [AIMessage(role=MessageRole.USER, content=prompt)]
         return await self.chat_completion(messages, **kwargs)
 
+    async def stream_text_completion(
+        self,
+        prompt: str,
+        **kwargs
+    ) -> AsyncGenerator[str, None]:
+        """Stream text completion using Anthropic Claude for long-running requests"""
+        messages = [AIMessage(role=MessageRole.USER, content=prompt)]
+        async for chunk in self.stream_chat_completion(messages, **kwargs):
+            yield chunk
+
+    async def stream_chat_completion(
+        self,
+        messages: List[AIMessage],
+        **kwargs
+    ) -> AsyncGenerator[str, None]:
+        """Stream chat completion using Anthropic Claude with proper streaming support"""
+        config = self._merge_config(**kwargs)
+        api_key = config.get("api_key", "")
+        base_url = config.get("base_url", "https://api.anthropic.com")
+        model = config.get("model", self.model)
+        temperature = config.get("temperature", 0.7)
+
+        # Convert messages to Anthropic format
+        system_message = None
+        claude_messages = []
+
+        for msg in messages:
+            if msg.role == MessageRole.SYSTEM:
+                system_message = msg.content if isinstance(msg.content, str) else str(msg.content)
+            else:
+                claude_messages.append(self._convert_message_to_anthropic(msg))
+
+        try:
+            import aiohttp
+
+            # Build URL
+            base_url = base_url.rstrip('/')
+            if not base_url.endswith('/v1'):
+                base_url = base_url + '/v1'
+            url = f"{base_url}/messages"
+
+            # Build request body. max_tokens is REQUIRED by the Anthropic Messages
+            # API — omitting it makes every streaming request fail with 400.
+            body = {
+                "model": model,
+                "messages": claude_messages,
+                "temperature": temperature,
+                "max_tokens": int(
+                    config.get("anthropic_max_tokens")
+                    or config.get("max_completion_tokens")
+                    or 8192
+                ),
+                "stream": True
+            }
+            if system_message:
+                body["system"] = system_message
+            self._apply_reasoning_config(body, config)
+
+            # Try both authentication methods
+            auth_methods = [
+                ("x-api-key", {"x-api-key": api_key}),  # Official Anthropic style
+                ("Authorization", {"Authorization": f"Bearer {api_key}"})  # MiniMax/other compatible APIs
+            ]
+
+            last_error: Optional[str] = None
+
+            for index, (auth_name, auth_header) in enumerate(auth_methods):
+                is_last_method = index == len(auth_methods) - 1
+                try:
+                    headers = {
+                        "Content-Type": "application/json",
+                        "anthropic-version": "2023-06-01"
+                    }
+                    headers.update(auth_header)
+
+                    async with aiohttp.ClientSession(timeout=_build_aiohttp_timeout(config)) as session:
+                        async with session.post(url, headers=headers, json=body) as response:
+                            if response.status != 200:
+                                error_text = await response.text()
+                                last_error = f"API error {response.status}: {error_text}"
+                                if not is_last_method:
+                                    # NOTE: `continue`, not `break` — the enclosing
+                                    # `async with` blocks are not loops, so `break`
+                                    # left the auth loop and the remaining methods
+                                    # (used by MiniMax and other compatible APIs)
+                                    # were never attempted.
+                                    logger.debug(
+                                        f"{auth_name} auth failed ({response.status}), trying next auth method"
+                                    )
+                                    continue
+                                raise Exception(last_error)
+
+                            # Parse streaming response (SSE format)
+                            async for line in response.content:
+                                line = line.decode('utf-8').strip()
+                                if line.startswith('data: '):
+                                    data = line[6:]
+                                    if data == '[DONE]':
+                                        break
+                                    try:
+                                        import json
+                                        event_data = json.loads(data)
+                                        if event_data.get('type') == 'content_block_delta':
+                                            delta = event_data.get('delta', {})
+                                            if delta.get('type') == 'text_delta':
+                                                text = delta.get('text', '')
+                                                if text:
+                                                    yield text
+                                    except json.JSONDecodeError:
+                                        pass
+                            return  # Success, exit the function
+
+                except Exception as auth_error:
+                    last_error = str(auth_error)
+                    logger.debug(f"Auth method {auth_name} failed: {auth_error}")
+                    if is_last_method:
+                        raise
+                    continue  # Try next auth method
+
+            raise Exception(f"All authentication methods failed: {last_error}")
+
+        except Exception as e:
+            logger.error(f"Anthropic streaming API error: {e}")
+            raise
+
 class GoogleProvider(AIProvider):
     """Google Gemini API provider"""
 
     def __init__(self, config: Dict[str, Any]):
         super().__init__(config)
+        # Base URL can be a mirror/proxy endpoint. Frontend config test hits:
+        #   {base_url}/v1beta/models/{model}:generateContent?key=...
+        # The google-generativeai SDK defaults to the official endpoint unless configured,
+        # so we keep the base_url and (when it's non-default) use direct REST calls.
+        self.base_url = config.get("base_url", "https://generativelanguage.googleapis.com")
         try:
             import google.generativeai as genai
 
             # Configure the API key
             genai.configure(api_key=config.get("api_key"))
-
-            # Store base_url for potential future use or proxy configurations
-            self.base_url = config.get("base_url", "https://generativelanguage.googleapis.com")
 
             self.client = genai
             self.model_instance = genai.GenerativeModel(config.get("model", "gemini-1.5-flash"))
@@ -379,6 +1046,196 @@ class GoogleProvider(AIProvider):
             logger.warning("Google Generative AI library not installed. Install with: pip install google-generativeai")
             self.client = None
             self.model_instance = None
+
+    def _should_use_rest_api(self, base_url: Optional[str]) -> bool:
+        """
+        Decide whether to use direct REST calls instead of the google-generativeai SDK.
+
+        We must use REST when base_url points to a mirror/proxy (possibly with a path prefix),
+        because the SDK may ignore it and attempt to connect to the official endpoint.
+        """
+        from urllib.parse import urlparse
+
+        if not base_url:
+            base_url = self.base_url
+
+        base_url = str(base_url).strip()
+        if not base_url:
+            return False
+
+        default_host = urlparse("https://generativelanguage.googleapis.com").netloc
+
+        # If base_url doesn't look like an URL, treat it as a host[:port][/prefix].
+        # Use REST for any non-default host, or when a path prefix is present.
+        if "://" not in base_url:
+            stripped = base_url.strip().lstrip("/")
+            host = stripped.split("/", 1)[0]
+            if host and host.lower() != default_host.lower():
+                return True
+            return "/" in stripped
+
+        parsed = urlparse(base_url)
+        # Any non-root path implies a prefix that the SDK cannot represent reliably.
+        if parsed.path and parsed.path not in ("", "/"):
+            return True
+
+        # Non-default host implies mirror/proxy.
+        return parsed.netloc and parsed.netloc.lower() != default_host.lower()
+
+    def _normalize_gemini_base_url(self, base_url: str) -> str:
+        """Normalize base_url to the API root without trailing /v1(/beta) suffix."""
+        base_url = (base_url or "").strip()
+        if not base_url:
+            return "https://generativelanguage.googleapis.com"
+
+        if not base_url.startswith("http"):
+            base_url = "https://" + base_url
+
+        base_url = base_url.rstrip("/")
+        for suffix in ("/v1beta", "/v1"):
+            if base_url.lower().endswith(suffix):
+                base_url = base_url[: -len(suffix)]
+                break
+        return base_url.rstrip("/")
+
+    def _messages_to_plaintext_prompt(self, messages: List[AIMessage]) -> str:
+        """Best-effort conversion for REST API (keeps text, degrades images to placeholders)."""
+        parts: List[str] = []
+        for msg in messages:
+            role_prefix = f"[{msg.role.value.upper()}]: "
+            if isinstance(msg.content, str):
+                parts.append(role_prefix + msg.content)
+            elif isinstance(msg.content, list):
+                msg_parts: List[str] = []
+                for part in msg.content:
+                    if isinstance(part, TextContent):
+                        msg_parts.append(part.text)
+                    elif isinstance(part, ImageContent):
+                        url = part.image_url.get("url", "")
+                        msg_parts.append(f"[Image: {url}]" if url else "[Image]")
+                parts.append(role_prefix + " ".join(p for p in msg_parts if p))
+            else:
+                parts.append(role_prefix + str(msg.content))
+        return "\n\n".join(parts)
+
+    async def _rest_generate_content(
+        self,
+        *,
+        base_url: str,
+        api_key: str,
+        model: str,
+        prompt: str,
+        generation_config: Dict[str, Any],
+        timeout_seconds: float,
+    ) -> Dict[str, Any]:
+        import aiohttp
+
+        base_url = self._normalize_gemini_base_url(base_url)
+        url = f"{base_url}/v1beta/models/{model}:generateContent"
+
+        safety_settings = [
+            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_ONLY_HIGH"},
+            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_ONLY_HIGH"},
+            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_ONLY_HIGH"},
+            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_ONLY_HIGH"},
+        ]
+
+        payload: Dict[str, Any] = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": generation_config,
+            "safetySettings": safety_settings,
+        }
+
+        timeout = _build_aiohttp_timeout(
+            {"llm_timeout_seconds": timeout_seconds},
+            default_seconds=600.0,
+        )
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            # Most mirrors and the official API support `?key=...`. Try that first.
+            async with session.post(url, params={"key": api_key}, json=payload) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+                error_text = await resp.text()
+
+            # Fallback: some proxies prefer header auth.
+            headers = {"x-goog-api-key": api_key}
+            async with session.post(url, headers=headers, json=payload) as resp2:
+                if resp2.status == 200:
+                    return await resp2.json()
+                error_text2 = await resp2.text()
+
+        raise RuntimeError(f"Gemini REST API request failed: {error_text.strip() or error_text2.strip()}")
+
+    def _extract_rest_text(self, data: Dict[str, Any]) -> tuple[str, str, Dict[str, int]]:
+        """Extract content, finish_reason, and usage from REST response JSON."""
+        finish_reason = "stop"
+        content = ""
+
+        try:
+            candidates = data.get("candidates") or []
+            if candidates:
+                candidate = candidates[0] or {}
+                finish_reason = candidate.get("finishReason") or candidate.get("finish_reason") or finish_reason
+
+                # Prefer the modern structure: candidate.content.parts[].text
+                candidate_content = candidate.get("content") or {}
+                candidate_parts = candidate_content.get("parts") or []
+                texts = [p.get("text", "") for p in candidate_parts if isinstance(p, dict) and p.get("text")]
+                if texts:
+                    content = "".join(texts)
+                else:
+                    # Fallback: some mirrors may return `text` directly.
+                    content = candidate.get("text") or ""
+        except Exception:
+            content = ""
+
+        usage_meta = data.get("usageMetadata") or data.get("usage_metadata") or {}
+        usage = {
+            "prompt_tokens": int(usage_meta.get("promptTokenCount") or 0),
+            "completion_tokens": int(usage_meta.get("candidatesTokenCount") or 0),
+            "total_tokens": int(usage_meta.get("totalTokenCount") or 0),
+        }
+        return content, str(finish_reason), usage
+
+    def _convert_tools_to_gemini(self, tools: Optional[List[Dict[str, Any]]]) -> Optional[List[Dict[str, Any]]]:
+        if not tools:
+            return None
+        declarations: List[Dict[str, Any]] = []
+        for tool in tools:
+            function = tool.get("function") if tool.get("type") == "function" else tool
+            if not isinstance(function, dict):
+                continue
+            declarations.append(
+                {
+                    "name": function.get("name"),
+                    "description": function.get("description") or "",
+                    "parameters": function.get("parameters") or {"type": "object", "properties": {}},
+                }
+            )
+        return [{"function_declarations": declarations}] if declarations else None
+
+    def _extract_gemini_tool_calls_from_response(self, response: Any) -> List[Dict[str, Any]]:
+        tool_calls: List[Dict[str, Any]] = []
+        candidates = getattr(response, "candidates", None) or []
+        if not candidates:
+            return tool_calls
+        parts = getattr(getattr(candidates[0], "content", None), "parts", None) or []
+        for index, part in enumerate(parts, start=1):
+            function_call = getattr(part, "function_call", None)
+            if not function_call:
+                continue
+            args = getattr(function_call, "args", {}) or {}
+            tool_calls.append(
+                {
+                    "id": f"gemini-tool-call-{index}",
+                    "type": "function",
+                    "function": {
+                        "name": getattr(function_call, "name", "") or "",
+                        "arguments": json.dumps(dict(args), ensure_ascii=False),
+                    },
+                }
+            )
+        return tool_calls
 
     def _convert_messages_to_gemini(self, messages: List[AIMessage]):
         """Convert AIMessage list to Gemini format, supporting multimodal content"""
@@ -495,24 +1352,49 @@ class GoogleProvider(AIProvider):
 
     async def chat_completion(self, messages: List[AIMessage], **kwargs) -> AIResponse:
         """Generate chat completion using Google Gemini"""
-        if not self.client or not self.model_instance:
-            raise RuntimeError("Google Gemini client not available")
-
         config = self._merge_config(**kwargs)
+        tools = config.pop("tools", None)
+        base_url = config.get("base_url") or self.base_url
+
+        # Use direct REST for mirrors/proxies to honor base_url.
+        if self._should_use_rest_api(base_url) or not self.client or not self.model_instance:
+            api_key = config.get("api_key") or self.config.get("api_key")
+            if not api_key:
+                raise RuntimeError("Google Gemini API key not configured")
+
+            model = config.get("model", self.model) or self.model
+            generation_config: Dict[str, Any] = {
+                "temperature": config.get("temperature", 0.7),
+                "topP": config.get("top_p", 1.0),
+            }
+
+            prompt_text = self._messages_to_plaintext_prompt(messages)
+            data = await self._rest_generate_content(
+                base_url=base_url,
+                api_key=api_key,
+                model=model,
+                prompt=prompt_text,
+                generation_config=generation_config,
+                timeout_seconds=_get_llm_timeout_seconds(config),
+            )
+            content, finish_reason, usage = self._extract_rest_text(data)
+            return AIResponse(
+                content=content,
+                model=model,
+                usage=usage,
+                finish_reason=finish_reason,
+                metadata={"provider": "google", "transport": "rest"},
+            )
 
         # Convert messages to Gemini format with multimodal support
         prompt = self._convert_messages_to_gemini(messages)
 
         try:
             # Configure generation parameters
-            # 确保max_tokens不会太小，至少1000个token用于生成内容
-            max_tokens = max(config.get("max_tokens", 16384), 1000)
             generation_config = {
                 "temperature": config.get("temperature", 0.7),
                 "top_p": config.get("top_p", 1.0),
-                # "max_output_tokens": max_tokens,
             }
-
             # 配置安全设置 - 设置为较宽松的安全级别以减少误拦截
             safety_settings = [
                 {
@@ -534,7 +1416,13 @@ class GoogleProvider(AIProvider):
             ]
 
 
-            response = await self._generate_async(prompt, generation_config, safety_settings)
+            response = await self._generate_async(
+                prompt,
+                generation_config,
+                safety_settings,
+                tools=self._convert_tools_to_gemini(tools),
+                timeout_seconds=_get_llm_timeout_seconds(config),
+            )
             logger.debug(f"Google Gemini API response: {response}")
 
             # 检查响应状态和安全过滤
@@ -590,6 +1478,7 @@ class GoogleProvider(AIProvider):
                     "total_tokens": response.usage_metadata.total_token_count if hasattr(response, 'usage_metadata') else 0
                 },
                 finish_reason=finish_reason,
+                tool_calls=self._extract_gemini_tool_calls_from_response(response),
                 metadata={"provider": "google"}
             )
 
@@ -597,7 +1486,15 @@ class GoogleProvider(AIProvider):
             logger.error(f"Google Gemini API error: {e}")
             raise
 
-    async def _generate_async(self, prompt, generation_config: Dict[str, Any], safety_settings=None):
+    async def _generate_async(
+        self,
+        prompt,
+        generation_config: Dict[str, Any],
+        safety_settings=None,
+        tools=None,
+        *,
+        timeout_seconds: float = 600.0,
+    ):
         """Async wrapper for Gemini generation - supports both text and multimodal content"""
         import asyncio
         loop = asyncio.get_event_loop()
@@ -608,13 +1505,18 @@ class GoogleProvider(AIProvider):
             }
             if safety_settings:
                 kwargs["safety_settings"] = safety_settings
+            if tools:
+                kwargs["tools"] = tools
 
             return self.model_instance.generate_content(
                 prompt,  # Can be string or list of parts
                 **kwargs
             )
 
-        return await loop.run_in_executor(None, _generate_sync)
+        return await asyncio.wait_for(
+            loop.run_in_executor(None, _generate_sync),
+            timeout=timeout_seconds,
+        )
 
     async def text_completion(self, prompt: str, **kwargs) -> AIResponse:
         """Generate text completion using Google Gemini"""
@@ -639,13 +1541,19 @@ class OllamaProvider(AIProvider):
             raise RuntimeError("Ollama client not available")
         
         config = self._merge_config(**kwargs)
+        tools = config.pop("tools", None)
         
         # Convert messages to Ollama format with multimodal support
         ollama_messages = []
         for msg in messages:
             if isinstance(msg.content, str):
                 # Simple text message
-                ollama_messages.append({"role": msg.role.value, "content": msg.content})
+                message = {"role": msg.role.value, "content": msg.content}
+                if msg.tool_call_id:
+                    message["tool_call_id"] = msg.tool_call_id
+                if msg.tool_calls:
+                    message["tool_calls"] = msg.tool_calls
+                ollama_messages.append(message)
             elif isinstance(msg.content, list):
                 # Multimodal message - convert to text description for Ollama
                 content_parts = []
@@ -668,26 +1576,34 @@ class OllamaProvider(AIProvider):
                 ollama_messages.append({"role": msg.role.value, "content": str(msg.content)})
         
         try:
-            response = await self.client.chat(
-                model=config.get("model", self.model),
-                messages=ollama_messages,
-                options={
-                    "temperature": config.get("temperature", 0.7),
-                    "top_p": config.get("top_p", 1.0),
-                    # "num_predict": config.get("max_tokens", 2000)
-                }
+            options: Dict[str, Any] = {
+                "temperature": config.get("temperature", 0.7),
+                "top_p": config.get("top_p", 1.0),
+            }
+
+            response = await asyncio.wait_for(
+                self.client.chat(
+                    model=config.get("model", self.model),
+                    messages=ollama_messages,
+                    tools=tools,
+                    options=options,
+                ),
+                timeout=_get_llm_timeout_seconds(config),
             )
             
-            content = response.get("message", {}).get("content", "")
+            response_message = response.get("message", {}) or {}
+            content = response_message.get("content", "") or ""
+            tool_calls = response_message.get("tool_calls") or []
             
             return AIResponse(
                 content=content,
                 model=config.get("model", self.model),
                 usage=self._calculate_usage(
-                    " ".join([msg.content for msg in messages]),
+                    " ".join([msg.content for msg in messages if isinstance(msg.content, str)]),
                     content
                 ),
                 finish_reason="stop",
+                tool_calls=tool_calls,
                 metadata={"provider": "ollama"}
             )
             
@@ -705,15 +1621,36 @@ class AIProviderFactory:
 
     _providers = {
         "openai": OpenAIProvider,
+        "azure_openai": AzureOpenAIProvider,
+        "azure": AzureOpenAIProvider,  # Alias for azure_openai
         "anthropic": AnthropicProvider,
         "google": GoogleProvider,
         "gemini": GoogleProvider,  # Alias for google
         "ollama": OllamaProvider,
         "302ai": OpenAIProvider,  # 302.AI uses OpenAI-compatible API
+        "landppt": OpenAIProvider,  # LandPPT Official uses OpenAI-compatible API
     }
 
+    _provider_cache: "OrderedDict[str, AIProvider]" = OrderedDict()
+    _provider_cache_lock = threading.RLock()
+    _max_cached_providers = 128
+
+    @staticmethod
+    def _config_fingerprint(config: Dict[str, Any]) -> str:
+        def _default(value: Any) -> str:
+            return repr(value)
+
+        payload = json.dumps(config, sort_keys=True, ensure_ascii=False, default=_default)
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
     @classmethod
-    def create_provider(cls, provider_name: str, config: Optional[Dict[str, Any]] = None) -> AIProvider:
+    def create_provider(
+        cls,
+        provider_name: str,
+        config: Optional[Dict[str, Any]] = None,
+        *,
+        use_cache: bool = True,
+    ) -> AIProvider:
         """Create an AI provider instance"""
         if config is None:
             config = ai_config.get_provider_config(provider_name)
@@ -722,13 +1659,40 @@ class AIProviderFactory:
         if provider_name not in cls._providers:
             raise ValueError(f"Unknown provider: {provider_name}")
 
+        if use_cache:
+            cache_key = f"{provider_name}:{cls._config_fingerprint(config)}"
+            with cls._provider_cache_lock:
+                cached = cls._provider_cache.get(cache_key)
+                if cached is not None:
+                    cls._provider_cache.move_to_end(cache_key)
+                    return cached
+
         provider_class = cls._providers[provider_name]
-        return provider_class(config)
+        provider = provider_class(dict(config))
+
+        if use_cache:
+            with cls._provider_cache_lock:
+                cached = cls._provider_cache.get(cache_key)
+                if cached is not None:
+                    cls._provider_cache.move_to_end(cache_key)
+                    return cached
+                cls._provider_cache[cache_key] = provider
+                cls._provider_cache.move_to_end(cache_key)
+                while len(cls._provider_cache) > cls._max_cached_providers:
+                    cls._provider_cache.popitem(last=False)
+
+        return provider
     
     @classmethod
     def get_available_providers(cls) -> List[str]:
         """Get list of available providers"""
         return list(cls._providers.keys())
+
+    @classmethod
+    def clear_cache(cls):
+        """Clear cached provider instances."""
+        with cls._provider_cache_lock:
+            cls._provider_cache.clear()
 
 class AIProviderManager:
     """Manager for AI provider instances with caching and reloading"""
@@ -741,6 +1705,9 @@ class AIProviderManager:
         """Get AI provider instance with caching"""
         if provider_name is None:
             provider_name = ai_config.default_ai_provider
+        if provider_name not in AIProviderFactory._providers:
+            logger.warning(f"Unknown provider '{provider_name}', falling back to 'openai'")
+            provider_name = "openai"
 
         # Get current config for the provider
         current_config = ai_config.get_provider_config(provider_name)
@@ -765,6 +1732,7 @@ class AIProviderManager:
         """Clear provider cache to force reload"""
         self._provider_cache.clear()
         self._config_cache.clear()
+        AIProviderFactory.clear_cache()
 
     def reload_provider(self, provider_name: str):
         """Reload a specific provider"""

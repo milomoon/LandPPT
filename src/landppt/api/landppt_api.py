@@ -2,8 +2,11 @@
 LandPPT specific API endpoints
 """
 
-from fastapi import APIRouter, HTTPException, UploadFile, File, Form, Request
+from fastapi import APIRouter, HTTPException, UploadFile, File, Form, Request, Depends
 from typing import List, Optional
+
+from ..auth.middleware import get_current_user_required
+from ..database.models import User
 import uuid
 import json
 import logging
@@ -12,14 +15,29 @@ import re
 from .models import (
     PPTScenario, PPTGenerationRequest, PPTGenerationResponse,
     PPTOutline, PPTProject, TodoBoard, ProjectListResponse,
+    ProjectRenameRequest,
     FileUploadResponse, SlideContent, FileOutlineGenerationRequest,
     FileOutlineGenerationResponse, TemplateSelectionRequest, TemplateSelectionResponse
 )
-from ..services.service_instances import ppt_service
+from ..services.service_instances import ppt_service, get_ppt_service_for_user
 from ..services.file_processor import FileProcessor
 from ..services.deep_research_service import DEEPResearchService
 from ..services.research_report_generator import ResearchReportGenerator
-from ..core.config import ai_config
+from ..core.config import ai_config, resolve_timeout_seconds
+from ..core.file_access import UnsafeFilePathError, validate_client_file_path
+from ..ai.providers import (
+    build_opencode_client_headers,
+    build_opencode_test_session_headers,
+)
+from ..services.runtime.ai_execution import (
+    ai_conversation_context,
+    new_ai_conversation_id,
+)
+
+
+ALLOWED_STAGE_STATUSES = frozenset(
+    {"pending", "running", "in_progress", "completed", "failed", "cancelled", "skipped"}
+)
 
 
 def filter_think_tags(content: str) -> str:
@@ -171,17 +189,24 @@ async def get_ai_providers():
 @router.post("/ai/providers/{provider_name}/test")
 async def test_ai_provider(provider_name: str, request: Request):
     """Test a specific AI provider - uses frontend provided config if available"""
+    # Anthropic has its own dedicated proxy endpoint in routes.py
+    if provider_name == "anthropic":
+        raise HTTPException(
+            status_code=400,
+            detail="Anthropic testing is handled by a dedicated endpoint. Please use the frontend test function."
+        )
+
     try:
         import aiohttp
         import json
-        
+
         # Try to get configuration from request body (if provided by frontend)
         body = None
         try:
             body = await request.json()
         except:
             pass  # No JSON body, use backend config
-        
+
         # Special handling for OpenAI provider with frontend config
         if provider_name == "openai" and body:
             base_url = body.get('base_url')
@@ -197,12 +222,18 @@ async def test_ai_provider(provider_name: str, request: Request):
                     base_url = base_url.rstrip('/') + '/v1'
                 
                 chat_url = f"{base_url}/chat/completions"
+                timeout_seconds = resolve_timeout_seconds(
+                    body.get("llm_timeout_seconds") if isinstance(body, dict) else None,
+                    ai_config.llm_timeout_seconds,
+                )
                 
                 async with aiohttp.ClientSession() as session:
                     headers = {
                         'Authorization': f'Bearer {api_key}',
                         'Content-Type': 'application/json'
                     }
+                    headers.update(build_opencode_client_headers(base_url))
+                    headers.update(build_opencode_test_session_headers(base_url))
                     
                     payload = {
                         "model": model,
@@ -215,7 +246,12 @@ async def test_ai_provider(provider_name: str, request: Request):
                         "temperature": 0
                     }
                     
-                    async with session.post(chat_url, headers=headers, json=payload, timeout=30) as response:
+                    async with session.post(
+                        chat_url,
+                        headers=headers,
+                        json=payload,
+                        timeout=aiohttp.ClientTimeout(total=timeout_seconds),
+                    ) as response:
                         if response.status == 200:
                             data = await response.json()
                             # Apply think tag filtering to the response
@@ -247,7 +283,8 @@ async def test_ai_provider(provider_name: str, request: Request):
             content="Hello, please respond with a brief greeting."
         )
 
-        response = await provider.chat_completion([test_message])
+        with ai_conversation_context(new_ai_conversation_id("provider-test")):
+            response = await provider.chat_completion([test_message])
 
         # Apply think tag filtering to the response content
         filtered_content = filter_think_tags(response.content)
@@ -324,40 +361,10 @@ async def get_scenarios():
 # Legacy PPT generation endpoint removed - now using project-based workflow
 # Use POST /projects to create a new project instead
 
-@router.post("/upload")
-async def upload_file(file: UploadFile = File(...)):
-    """Upload document for PPT generation"""
-    try:
-        # Validate file type
-        allowed_types = [".docx", ".pdf", ".txt", ".md"]
-        file_extension = "." + file.filename.split(".")[-1].lower()
-        
-        if file_extension not in allowed_types:
-            raise HTTPException(
-                status_code=400, 
-                detail=f"Unsupported file type. Allowed types: {', '.join(allowed_types)}"
-            )
-        
-        # Read file content
-        content = await file.read()
-        
-        # Process file based on type
-        processed_content = await ppt_service.process_uploaded_file(
-            filename=file.filename,
-            content=content,
-            file_type=file_extension
-        )
-        
-        return {
-            "filename": file.filename,
-            "size": len(content),
-            "type": file_extension,
-            "processed_content": processed_content,
-            "message": "File uploaded and processed successfully"
-        }
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing file: {str(e)}")
+# NOTE: POST /upload is registered once, further down, against FileProcessor.
+# A second, earlier registration used to shadow it (FastAPI matches the first
+# route), so uploads were limited to .docx/.pdf/.txt/.md and the documented
+# FileUploadResponse schema was never returned.
 
 # Legacy task management endpoints removed - now using project-based workflow
 # Use /projects endpoints for project management instead
@@ -375,29 +382,47 @@ async def generate_outline(request: PPTGenerationRequest):
 # New Project Management Endpoints
 
 @router.post("/projects", response_model=PPTProject)
-async def create_project(request: PPTGenerationRequest):
+async def create_project(
+    request: PPTGenerationRequest,
+    user: User = Depends(get_current_user_required)
+):
     """Create a new PPT project with TODO workflow"""
     try:
-        project = await ppt_service.create_project_with_workflow(request)
+        # Ensure user_id is set from authenticated user
+        request.user_id = user.id
+        user_ppt_service = get_ppt_service_for_user(user.id)
+        project = await user_ppt_service.create_project_with_workflow(request)
         return project
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error creating project: {str(e)}")
 
 @router.get("/projects", response_model=ProjectListResponse)
-async def list_projects(page: int = 1, page_size: int = 10, status: Optional[str] = None):
-    """List projects with pagination"""
+async def list_projects(
+    page: int = 1,
+    page_size: int = 10,
+    status: Optional[str] = None,
+    user: User = Depends(get_current_user_required)
+):
+    """List projects with pagination - only returns projects owned by current user"""
     try:
-        return await ppt_service.project_manager.list_projects(page, page_size, status)
+        user_ppt_service = get_ppt_service_for_user(user.id)
+        return await user_ppt_service.project_manager.list_projects(
+            page=page, page_size=page_size, status=status, user_id=user.id
+        )
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error listing projects: {str(e)}")
 
 @router.get("/projects/{project_id}", response_model=PPTProject)
-async def get_project(project_id: str):
-    """Get project details"""
+async def get_project(
+    project_id: str,
+    user: User = Depends(get_current_user_required)
+):
+    """Get project details - enforces user ownership"""
     try:
-        project = await ppt_service.project_manager.get_project(project_id)
+        user_ppt_service = get_ppt_service_for_user(user.id)
+        project = await user_ppt_service.project_manager.get_project(project_id, user_id=user.id)
         if not project:
             raise HTTPException(status_code=404, detail="Project not found")
         return project
@@ -407,11 +432,75 @@ async def get_project(project_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error getting project: {str(e)}")
 
-@router.get("/projects/{project_id}/todo", response_model=TodoBoard)
-async def get_project_todo_board(project_id: str):
-    """Get TODO board for a project"""
+@router.post("/projects/{project_id}/duplicate")
+async def duplicate_project(
+    project_id: str,
+    user: User = Depends(get_current_user_required)
+):
+    """Duplicate a project for the current user."""
     try:
-        todo_board = await ppt_service.get_project_todo_board(project_id)
+        user_ppt_service = get_ppt_service_for_user(user.id)
+        project = await user_ppt_service.project_manager.duplicate_project(project_id, user_id=user.id)
+        if not project:
+            raise HTTPException(status_code=404, detail="Project not found")
+        return {
+            "status": "success",
+            "message": "Project duplicated successfully",
+            "project_id": project.project_id,
+            "project": project,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error duplicating project: {str(e)}")
+
+@router.patch("/projects/{project_id}/rename")
+async def rename_project(
+    project_id: str,
+    request: ProjectRenameRequest,
+    user: User = Depends(get_current_user_required)
+):
+    """Rename a project owned by the current user."""
+    title = request.title.strip()
+    if not title:
+        raise HTTPException(status_code=422, detail="Project title is required")
+
+    try:
+        user_ppt_service = get_ppt_service_for_user(user.id)
+        project = await user_ppt_service.project_manager.get_project(project_id, user_id=user.id)
+        if not project:
+            raise HTTPException(status_code=404, detail="Project not found")
+
+        success = await user_ppt_service.project_manager.update_project_data(
+            project_id,
+            {"title": title},
+            user_id=user.id,
+        )
+        if not success:
+            raise HTTPException(status_code=500, detail="Failed to rename project")
+
+        return {
+            "status": "success",
+            "message": "Project renamed successfully",
+            "project_id": project_id,
+            "title": title,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error renaming project: {str(e)}")
+
+@router.get("/projects/{project_id}/todo", response_model=TodoBoard)
+async def get_project_todo_board(
+    project_id: str,
+    user: User = Depends(get_current_user_required)
+):
+    """Get TODO board for a project - enforces user ownership"""
+    try:
+        user_ppt_service = get_ppt_service_for_user(user.id)
+        todo_board = await user_ppt_service.get_project_todo_board(project_id, user_id=user.id)
         if not todo_board:
             raise HTTPException(status_code=404, detail="TODO board not found")
         return todo_board
@@ -422,8 +511,13 @@ async def get_project_todo_board(project_id: str):
         raise HTTPException(status_code=500, detail=f"Error getting TODO board: {str(e)}")
 
 @router.put("/projects/{project_id}/stages/{stage_id}")
-async def update_project_stage(project_id: str, stage_id: str, request: Request):
-    """Update project stage status"""
+async def update_project_stage(
+    project_id: str,
+    stage_id: str,
+    request: Request,
+    user: User = Depends(get_current_user_required)
+):
+    """Update project stage status - enforces user ownership"""
     try:
         # Parse JSON body
         body = await request.json()
@@ -433,8 +527,28 @@ async def update_project_stage(project_id: str, stage_id: str, request: Request)
         if not status:
             raise HTTPException(status_code=422, detail="Status is required")
 
-        success = await ppt_service.update_project_stage(
-            project_id, stage_id, status, progress
+        if status not in ALLOWED_STAGE_STATUSES:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "Invalid stage status. Allowed values: "
+                    + ", ".join(sorted(ALLOWED_STAGE_STATUSES))
+                ),
+            )
+
+        if progress is not None:
+            try:
+                progress = float(progress)
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=422, detail="Progress must be a number")
+            if not 0.0 <= progress <= 100.0:
+                raise HTTPException(
+                    status_code=422, detail="Progress must be between 0 and 100"
+                )
+
+        user_ppt_service = get_ppt_service_for_user(user.id)
+        success = await user_ppt_service.update_project_stage(
+            project_id, stage_id, status, progress, user_id=user.id
         )
         if not success:
             raise HTTPException(status_code=404, detail="Project or stage not found")
@@ -446,8 +560,12 @@ async def update_project_stage(project_id: str, stage_id: str, request: Request)
         raise HTTPException(status_code=500, detail=f"Error updating stage: {str(e)}")
 
 @router.post("/projects/{project_id}/continue-from-stage")
-async def continue_from_stage(project_id: str, request: Request):
-    """Continue project workflow from a specific stage"""
+async def continue_from_stage(
+    project_id: str,
+    request: Request,
+    user: User = Depends(get_current_user_required)
+):
+    """Continue project workflow from a specific stage - enforces user ownership"""
     try:
         # Parse JSON body
         body = await request.json()
@@ -456,18 +574,19 @@ async def continue_from_stage(project_id: str, request: Request):
         if not stage_id:
             raise HTTPException(status_code=422, detail="Stage ID is required")
 
-        # Get project
-        project = await ppt_service.project_manager.get_project(project_id)
+        # Get project with user ownership check
+        user_ppt_service = get_ppt_service_for_user(user.id)
+        project = await user_ppt_service.project_manager.get_project(project_id, user_id=user.id)
         if not project:
             raise HTTPException(status_code=404, detail="Project not found")
 
         # Reset stages from the specified stage onwards
-        success = await ppt_service.reset_stages_from(project_id, stage_id)
+        success = await user_ppt_service.reset_stages_from(project_id, stage_id, user_id=user.id)
         if not success:
             raise HTTPException(status_code=400, detail="Failed to reset stages")
 
         # Start workflow from the specified stage
-        await ppt_service.start_workflow_from_stage(project_id, stage_id)
+        await user_ppt_service.start_workflow_from_stage(project_id, stage_id, user_id=user.id)
 
         return {
             "status": "success",
@@ -484,10 +603,15 @@ async def continue_from_stage(project_id: str, request: Request):
 
 
 @router.post("/projects/{project_id}/slides/{slide_index}/lock")
-async def lock_slide(project_id: str, slide_index: int):
-    """Lock a slide to prevent regeneration"""
+async def lock_slide(
+    project_id: str,
+    slide_index: int,
+    user: User = Depends(get_current_user_required)
+):
+    """Lock a slide to prevent regeneration - enforces user ownership"""
     try:
-        success = await ppt_service.lock_slide(project_id, slide_index)
+        user_ppt_service = get_ppt_service_for_user(user.id)
+        success = await user_ppt_service.lock_slide(project_id, slide_index, user_id=user.id)
         if not success:
             raise HTTPException(status_code=404, detail="Slide not found")
         return {"status": "success", "message": "Slide locked successfully"}
@@ -498,10 +622,15 @@ async def lock_slide(project_id: str, slide_index: int):
         raise HTTPException(status_code=500, detail=f"Error locking slide: {str(e)}")
 
 @router.post("/projects/{project_id}/slides/{slide_index}/unlock")
-async def unlock_slide(project_id: str, slide_index: int):
-    """Unlock a slide to allow regeneration"""
+async def unlock_slide(
+    project_id: str,
+    slide_index: int,
+    user: User = Depends(get_current_user_required)
+):
+    """Unlock a slide to allow regeneration - enforces user ownership"""
     try:
-        success = await ppt_service.unlock_slide(project_id, slide_index)
+        user_ppt_service = get_ppt_service_for_user(user.id)
+        success = await user_ppt_service.unlock_slide(project_id, slide_index, user_id=user.id)
         if not success:
             raise HTTPException(status_code=404, detail="Slide not found")
         return {"status": "success", "message": "Slide unlocked successfully"}
@@ -512,20 +641,31 @@ async def unlock_slide(project_id: str, slide_index: int):
         raise HTTPException(status_code=500, detail=f"Error unlocking slide: {str(e)}")
 
 @router.get("/projects/{project_id}/versions")
-async def get_project_versions(project_id: str):
-    """Get all versions of a project"""
+async def get_project_versions(
+    project_id: str,
+    user: User = Depends(get_current_user_required)
+):
+    """Get all versions of a project - enforces user ownership"""
     try:
-        versions = await ppt_service.project_manager.get_project_versions(project_id)
+        user_ppt_service = get_ppt_service_for_user(user.id)
+        versions = await user_ppt_service.project_manager.get_project_versions(project_id, user_id=user.id)
         return {"versions": versions, "status": "success"}
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error getting project versions: {str(e)}")
 
 @router.post("/projects/{project_id}/versions/{version}/restore")
-async def restore_project_version(project_id: str, version: int):
-    """Restore project to a specific version"""
+async def restore_project_version(
+    project_id: str,
+    version: int,
+    user: User = Depends(get_current_user_required)
+):
+    """Restore project to a specific version - enforces user ownership"""
     try:
-        success = await ppt_service.project_manager.restore_project_version(project_id, version)
+        user_ppt_service = get_ppt_service_for_user(user.id)
+        success = await user_ppt_service.project_manager.restore_project_version(
+            project_id, version, user_id=user.id
+        )
         if not success:
             raise HTTPException(status_code=404, detail="Project or version not found")
         return {"status": "success", "message": "Project restored successfully"}
@@ -536,10 +676,14 @@ async def restore_project_version(project_id: str, version: int):
         raise HTTPException(status_code=500, detail=f"Error restoring project version: {str(e)}")
 
 @router.delete("/projects/{project_id}")
-async def delete_project(project_id: str):
-    """Delete a project"""
+async def delete_project(
+    project_id: str,
+    user: User = Depends(get_current_user_required)
+):
+    """Delete a project - enforces user ownership"""
     try:
-        success = await ppt_service.project_manager.delete_project(project_id)
+        user_ppt_service = get_ppt_service_for_user(user.id)
+        success = await user_ppt_service.project_manager.delete_project(project_id, user_id=user.id)
         if not success:
             raise HTTPException(status_code=404, detail="Project not found")
         return {"status": "success", "message": "Project deleted successfully"}
@@ -550,10 +694,14 @@ async def delete_project(project_id: str):
         raise HTTPException(status_code=500, detail=f"Error deleting project: {str(e)}")
 
 @router.post("/projects/{project_id}/archive")
-async def archive_project(project_id: str):
-    """Archive a project"""
+async def archive_project(
+    project_id: str,
+    user: User = Depends(get_current_user_required)
+):
+    """Archive a project - enforces user ownership"""
     try:
-        success = await ppt_service.project_manager.archive_project(project_id)
+        user_ppt_service = get_ppt_service_for_user(user.id)
+        success = await user_ppt_service.project_manager.archive_project(project_id, user_id=user.id)
         if not success:
             raise HTTPException(status_code=404, detail="Project not found")
         return {"status": "success", "message": "Project archived successfully"}
@@ -618,9 +766,10 @@ async def create_project_from_upload(
     topic: Optional[str] = Form(None),
     scenario: Optional[str] = Form(None),
     requirements: Optional[str] = Form(None),
-    language: str = Form("zh")
+    language: str = Form("zh"),
+    user: User = Depends(get_current_user_required)
 ):
-    """Upload file and create project directly"""
+    """Upload file and create project directly - associates with current user"""
     try:
         # Validate and process file
         is_valid, message = file_processor.validate_file(file.filename, file.size)
@@ -654,11 +803,13 @@ async def create_project_from_upload(
             if requirements:
                 ppt_data['requirements'] = requirements
 
-            # Create project request
+            # Create project request with user_id
             project_request = PPTGenerationRequest(**ppt_data)
+            project_request.user_id = user.id
 
             # Create project with workflow
-            project = await ppt_service.create_project_with_workflow(project_request)
+            user_ppt_service = get_ppt_service_for_user(user.id)
+            project = await user_ppt_service.create_project_with_workflow(project_request)
 
             return project
 
@@ -724,12 +875,25 @@ async def generate_slides(outline: PPTOutline, scenario: str = "general"):
         raise HTTPException(status_code=500, detail=f"Error generating slides: {str(e)}")
 
 @router.post("/files/generate-outline", response_model=FileOutlineGenerationResponse)
-async def generate_outline_from_file(request: FileOutlineGenerationRequest):
+async def generate_outline_from_file(
+    request: FileOutlineGenerationRequest,
+    user: User = Depends(get_current_user_required)
+):
     """使用summeryanyfile从文件生成PPT大纲"""
     try:
-        # 调用增强的PPT服务来生成大纲
-        result = await ppt_service.generate_outline_from_file(request)
+        # file_path arrives from the client: confine it to the upload roots
+        # before anything opens it or hands it to a parser.
+        try:
+            validate_client_file_path(request.file_path)
+        except UnsafeFilePathError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+        user_ppt_service = get_ppt_service_for_user(user.id)
+        result = await user_ppt_service.generate_outline_from_file(request)
         return result
+
+    except HTTPException:
+        raise
 
     except Exception as e:
         logger.error(f"Error generating outline from file: {e}")
@@ -755,6 +919,9 @@ async def upload_file_and_generate_outline(
     focus_content: Optional[str] = Form(None),
     tech_highlights: Optional[str] = Form(None),
     target_audience: Optional[str] = Form(None),
+    custom_audience: Optional[str] = Form(None),
+    requirements: Optional[str] = Form(None),
+    description: Optional[str] = Form(None),
     network_mode: bool = Form(False),  # 是否启用联网搜索（与项目创建保持一致）
     language: str = Form("zh")  # 语言参数
 ):
@@ -783,7 +950,11 @@ async def upload_file_and_generate_outline(
                     temp_file_paths.append(temp_file_path)
 
                 # 处理单个文件
-                file_result = await file_processor.process_file(temp_file_path, file.filename)
+                file_result = await file_processor.process_file(
+                    temp_file_path,
+                    file.filename,
+                    file_processing_mode=file_processing_mode,
+                )
                 all_processed_content.append({
                     "filename": file.filename,
                     "content": file_result.processed_content
@@ -798,9 +969,12 @@ async def upload_file_and_generate_outline(
                 context = {
                     'scenario': scenario,
                     'target_audience': target_audience or '普通大众',
-                    'requirements': '',
+                    'custom_audience': custom_audience or '',
+                    'requirements': requirements or '',
                     'ppt_style': ppt_style,
-                    'description': f'文件数量: {len(files)}'
+                    'description': description or '',
+                    'source_summary': f'文件数量: {len(files)}',
+                    'file_processing_mode': file_processing_mode,
                 }
 
                 # 获取所有文件路径
@@ -841,7 +1015,10 @@ async def upload_file_and_generate_outline(
                 filename=final_filename,
                 topic=topic,
                 scenario=scenario,
-                requirements="",  # API调用暂时没有requirements参数
+                requirements=requirements,
+                target_audience=target_audience,
+                custom_audience=custom_audience,
+                description=description,
                 page_count_mode=page_count_mode,
                 min_pages=min_pages,
                 max_pages=max_pages,
@@ -850,7 +1027,6 @@ async def upload_file_and_generate_outline(
                 custom_style_prompt=custom_style_prompt,
                 file_processing_mode=file_processing_mode,
                 content_analysis_depth=content_analysis_depth,
-                target_audience=target_audience,
                 language=language
             )
 
@@ -888,17 +1064,26 @@ async def upload_file_and_generate_outline(
 
 
 @router.post("/projects/{project_id}/select-template", response_model=TemplateSelectionResponse)
-async def select_global_template_for_project(project_id: str, request: TemplateSelectionRequest):
-    """为项目选择全局母版模板"""
+async def select_global_template_for_project(
+    project_id: str,
+    request: TemplateSelectionRequest,
+    user: User = Depends(get_current_user_required)
+):
+    """为项目选择全局母版模板 - enforces user ownership"""
     try:
         # 验证项目ID匹配
         if request.project_id != project_id:
             raise HTTPException(status_code=400, detail="Project ID mismatch")
 
-        # 选择模板
-        result = await ppt_service.select_global_template_for_project(
-            project_id, request.selected_template_id
-        )
+        # 选择模板 with user ownership check
+        user_ppt_service = get_ppt_service_for_user(user.id)
+
+        if request.template_mode == "free":
+            result = await user_ppt_service.select_free_template_for_project(project_id, user_id=user.id)
+        else:
+            # "default" 和未指定都等价于 selected_template_id=None（由后端选择默认模板）
+            template_id = None if request.template_mode == "default" else request.selected_template_id
+            result = await user_ppt_service.select_global_template_for_project(project_id, template_id, user_id=user.id)
 
         if not result['success']:
             raise HTTPException(status_code=400, detail=result['message'])
@@ -912,10 +1097,14 @@ async def select_global_template_for_project(project_id: str, request: TemplateS
 
 
 @router.get("/projects/{project_id}/selected-template")
-async def get_selected_global_template(project_id: str):
-    """获取项目选择的全局母版模板"""
+async def get_selected_global_template(
+    project_id: str,
+    user: User = Depends(get_current_user_required)
+):
+    """获取项目选择的全局母版模板 - enforces user ownership"""
     try:
-        template = await ppt_service.get_selected_global_template(project_id)
+        user_ppt_service = get_ppt_service_for_user(user.id)
+        template = await user_ppt_service.get_selected_global_template(project_id, user_id=user.id)
 
         if not template:
             return {"selected_template": None, "message": "No template selected"}

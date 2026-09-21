@@ -7,19 +7,23 @@ import logging
 from typing import List, Optional, Dict, Any, Tuple
 from pathlib import Path
 import time
+import hashlib
 
 from .models import (
     ImageInfo, ImageSearchRequest, ImageGenerationRequest, ImageUploadRequest,
     ImageSearchResult, ImageOperationResult, ImageProcessingOptions,
-    ImageSourceType, ImageProvider
+    ImageSourceType, ImageProvider, ImageFormat
 )
 from .providers.base import provider_registry, ImageSearchProvider, ImageGenerationProvider, LocalStorageProvider
 from .processors.image_processor import ImageProcessor
-from .cache.image_cache import ImageCacheManager
+from .processors.webp_converter import convert_image_bytes_to_webp
+from .cache.image_cache import ImageCacheManager, StorageQuotaExceededError
 from .matching.image_matcher import ImageMatcher
 from .adapters.ppt_prompt_adapter import PPTPromptAdapter, PPTSlideContext
 
 logger = logging.getLogger(__name__)
+
+from ...auth.request_context import current_user_id, USER_SCOPE_ALL
 
 
 class ImageService:
@@ -91,7 +95,7 @@ class ImageService:
             from .providers.dalle_provider import DalleProvider
             from .providers.stable_diffusion_provider import StableDiffusionProvider
             from .providers.silicon_flow_provider import SiliconFlowProvider
-            from .providers.pollinations_provider import PollinationsProvider
+
             from .config.image_config import is_provider_configured
 
             # 注册DALL-E提供者
@@ -121,15 +125,6 @@ class ImageService:
             else:
                 logger.debug("SiliconFlow API key not configured, skipping provider registration")
 
-            # 注册Pollinations提供者
-            if is_provider_configured('pollinations'):
-                pollinations_config = self.config.get('pollinations', {})
-                pollinations_provider = PollinationsProvider(pollinations_config)
-                provider_registry.register(pollinations_provider)
-                logger.debug("Pollinations provider registered")
-            else:
-                logger.debug("Pollinations provider not configured, skipping provider registration")
-
             # 注册Gemini图片生成提供者
             if is_provider_configured('gemini'):
                 from .providers.gemini_provider import GeminiImageProvider
@@ -149,6 +144,16 @@ class ImageService:
                 logger.debug("OpenAI image provider registered")
             else:
                 logger.debug("OpenAI Image API key not configured, skipping provider registration")
+
+            # 注册 Pollinations 图片生成提供者
+            if is_provider_configured('pollinations'):
+                from .providers.pollinations_provider import PollinationsProvider
+                pollinations_config = self.config.get('pollinations', {})
+                pollinations_provider = PollinationsProvider(pollinations_config)
+                provider_registry.register(pollinations_provider)
+                logger.debug("Pollinations image provider registered")
+            else:
+                logger.debug("Pollinations API key not configured, skipping provider registration")
 
             # 初始化网络搜索提供者
             from .config.image_config import ImageServiceConfig
@@ -194,6 +199,168 @@ class ImageService:
 
         except Exception as e:
             logger.error(f"Failed to initialize image providers: {e}")
+
+    async def reload_providers_for_user(self, user_id: Optional[int] = None):
+        """
+        重新加载用户特定的图片提供者配置。
+        这会从数据库加载用户配置的API密钥，并重新创建相应的提供者。
+        
+        Args:
+            user_id: 用户ID，如果为None则使用系统级配置
+        """
+        try:
+            from .config.image_config import ImageServiceConfig, is_provider_configured
+            
+            # 创建新的配置实例并从数据库加载用户配置
+            config_manager = ImageServiceConfig()
+            await config_manager.load_config_from_db_async(user_id)
+            
+            # 更新实例的config
+            self.config = config_manager.get_config()
+            
+            # 清除现有的AI生成提供者（保留存储提供者）
+            from .providers.base import provider_registry
+            
+            # 获取当前的生成提供者列表副本并逐个移除
+            existing_generation_providers = list(provider_registry.get_generation_providers())
+            for provider in existing_generation_providers:
+                try:
+                    provider_registry.unregister(provider.provider)
+                except Exception as e:
+                    logger.warning(f"Failed to unregister provider {provider.provider}: {e}")
+            
+            # 重新注册AI图片生成提供者
+            from .providers.dalle_provider import DalleProvider
+            from .providers.stable_diffusion_provider import StableDiffusionProvider
+            from .providers.silicon_flow_provider import SiliconFlowProvider
+            
+            # 注册DALL-E提供者
+            dalle_config = self.config.get('dalle', {})
+            if dalle_config.get('api_key'):
+                dalle_provider = DalleProvider(dalle_config)
+                provider_registry.register(dalle_provider)
+                logger.debug(f"DALL-E provider reloaded for user {user_id}")
+            
+            # 注册Stable Diffusion提供者
+            sd_config = self.config.get('stable_diffusion', {})
+            if sd_config.get('api_key'):
+                sd_provider = StableDiffusionProvider(sd_config)
+                provider_registry.register(sd_provider)
+                logger.debug(f"Stable Diffusion provider reloaded for user {user_id}")
+            
+            # 注册SiliconFlow提供者
+            sf_config = self.config.get('siliconflow', {})
+            sf_api_key = sf_config.get('api_key')
+            logger.info(f"SiliconFlow config for user {user_id}: api_key={'***' + sf_api_key[-4:] if sf_api_key and len(sf_api_key) > 4 else '(empty)'}")
+            if sf_api_key:
+                sf_provider = SiliconFlowProvider(sf_config)
+                provider_registry.register(sf_provider)
+                logger.info(f"SiliconFlow provider registered for user {user_id}")
+            
+            # 注册Gemini图片生成提供者
+            gemini_config = self.config.get('gemini', {})
+            if gemini_config.get('api_key'):
+                from .providers.gemini_provider import GeminiImageProvider
+                gemini_provider = GeminiImageProvider(gemini_config)
+                provider_registry.register(gemini_provider)
+                logger.debug(f"Gemini image provider reloaded for user {user_id}")
+            
+            # 注册OpenAI图片生成提供者
+            openai_image_config = self.config.get('openai_image', {})
+            if openai_image_config.get('api_key'):
+                from .providers.openai_image_provider import OpenAIImageProvider
+                openai_image_provider = OpenAIImageProvider(openai_image_config)
+                provider_registry.register(openai_image_provider)
+                logger.debug(f"OpenAI image provider reloaded for user {user_id}")
+
+            # 注册 Pollinations 图片生成提供者
+            pollinations_config = self.config.get('pollinations', {})
+            if pollinations_config.get('api_key'):
+                from .providers.pollinations_provider import PollinationsProvider
+                pollinations_provider = PollinationsProvider(pollinations_config)
+                provider_registry.register(pollinations_provider)
+                logger.debug(f"Pollinations image provider reloaded for user {user_id}")
+             
+            logger.info(f"Successfully reloaded image providers for user {user_id}")
+             
+        except Exception as e:
+            logger.error(f"Failed to reload image providers for user {user_id}: {e}")
+
+    def reload_providers_for_user_sync(self, user_id: Optional[int] = None):
+        """Sync variant of provider reload that avoids async DB access."""
+        try:
+            from .config.image_config import ImageServiceConfig
+
+            config_manager = ImageServiceConfig()
+            config_manager.load_config_from_db_sync(user_id)
+
+            self.config = config_manager.get_config()
+
+            from .providers.base import provider_registry
+
+            existing_generation_providers = list(provider_registry.get_generation_providers())
+            for provider in existing_generation_providers:
+                try:
+                    provider_registry.unregister(provider.provider)
+                except Exception as e:
+                    logger.warning(f"Failed to unregister provider {provider.provider}: {e}")
+
+            from .providers.dalle_provider import DalleProvider
+            from .providers.stable_diffusion_provider import StableDiffusionProvider
+            from .providers.silicon_flow_provider import SiliconFlowProvider
+
+            dalle_config = self.config.get('dalle', {})
+            if dalle_config.get('api_key'):
+                dalle_provider = DalleProvider(dalle_config)
+                provider_registry.register(dalle_provider)
+                logger.debug(f"DALL-E provider reloaded for user {user_id}")
+
+            sd_config = self.config.get('stable_diffusion', {})
+            if sd_config.get('api_key'):
+                sd_provider = StableDiffusionProvider(sd_config)
+                provider_registry.register(sd_provider)
+                logger.debug(f"Stable Diffusion provider reloaded for user {user_id}")
+
+            sf_config = self.config.get('siliconflow', {})
+            sf_api_key = sf_config.get('api_key')
+            logger.info(
+                "SiliconFlow config for user %s: api_key=%s",
+                user_id,
+                "***" + sf_api_key[-4:] if sf_api_key and len(sf_api_key) > 4 else "(empty)",
+            )
+            if sf_api_key:
+                sf_provider = SiliconFlowProvider(sf_config)
+                provider_registry.register(sf_provider)
+                logger.info(f"SiliconFlow provider registered for user {user_id}")
+
+            gemini_config = self.config.get('gemini', {})
+            if gemini_config.get('api_key'):
+                from .providers.gemini_provider import GeminiImageProvider
+
+                gemini_provider = GeminiImageProvider(gemini_config)
+                provider_registry.register(gemini_provider)
+                logger.debug(f"Gemini image provider reloaded for user {user_id}")
+
+            openai_image_config = self.config.get('openai_image', {})
+            if openai_image_config.get('api_key'):
+                from .providers.openai_image_provider import OpenAIImageProvider
+
+                openai_image_provider = OpenAIImageProvider(openai_image_config)
+                provider_registry.register(openai_image_provider)
+                logger.debug(f"OpenAI image provider reloaded for user {user_id}")
+
+            pollinations_config = self.config.get('pollinations', {})
+            if pollinations_config.get('api_key'):
+                from .providers.pollinations_provider import PollinationsProvider
+
+                pollinations_provider = PollinationsProvider(pollinations_config)
+                provider_registry.register(pollinations_provider)
+                logger.debug(f"Pollinations image provider reloaded for user {user_id}")
+
+            logger.info(f"Successfully reloaded image providers for user {user_id}")
+        except Exception as e:
+            logger.error(f"Failed to reload image providers for user {user_id}: {e}")
+
 
     def _sort_providers_by_preference(self, providers: List[ImageSearchProvider]) -> List[ImageSearchProvider]:
         """根据默认配置对搜索提供者进行排序"""
@@ -442,13 +609,57 @@ class ImageService:
             
             # 如果生成成功，缓存图片
             if result.success and result.image_info:
+                original_path = Path(result.image_info.local_path) if result.image_info.local_path else None
                 # 读取生成的图片
                 with open(result.image_info.local_path, 'rb') as f:
                     image_data = f.read()
-                
+
+                # Convert to WebP to reduce storage usage (AI-generated images are often large PNGs)
+                processing_cfg = self.config.get("processing", {}) or {}
+                if bool(processing_cfg.get("upload_convert_to_webp", True)):
+                    webp_quality = int(processing_cfg.get("upload_webp_quality", processing_cfg.get("default_quality", 80)))
+                    webp_quality = max(1, min(100, webp_quality))
+                    webp_method = int(processing_cfg.get("upload_webp_method", 6))
+                    skip_animated = bool(processing_cfg.get("upload_skip_animated", True))
+                    try:
+                        converted_bytes, info = convert_image_bytes_to_webp(
+                            image_data,
+                            quality=webp_quality,
+                            method=webp_method,
+                            skip_if_webp=True,
+                            skip_animated=skip_animated,
+                        )
+                        if info.converted:
+                            result.image_info.filename = f"{Path(result.image_info.filename).stem}.webp"
+                            result.image_info.metadata.format = ImageFormat.WEBP
+                            result.image_info.metadata.file_size = len(converted_bytes)
+                            result.image_info.metadata.width = info.width
+                            result.image_info.metadata.height = info.height
+                            result.image_info.metadata.color_mode = info.color_mode
+                            result.image_info.metadata.has_transparency = info.has_transparency
+                            image_data = converted_bytes
+                    except Exception as e:
+                        logger.warning(f"WebP conversion skipped for generated image {result.image_info.filename}: {e}")
+                 
                 # 缓存图片
-                cache_key = await self.cache_manager.cache_image(result.image_info, image_data)
-                logger.info(f"Generated image cached: {cache_key}")
+                try:
+                    cache_key = await self.cache_manager.cache_image(result.image_info, image_data)
+                    logger.info(f"Generated image cached: {cache_key}")
+                except StorageQuotaExceededError as e:
+                    used_mb = e.used_bytes / (1024 * 1024)
+                    quota_mb = e.quota_bytes / (1024 * 1024)
+                    return ImageOperationResult(
+                        success=False,
+                        message=f"存储空间已满：已使用 {used_mb:.1f}MB，单用户上限 {quota_mb:.0f}MB。请先删除部分图片再生成。",
+                        error_code="storage_quota_exceeded",
+                    )
+
+                # Remove original provider file (cache holds the persisted artifact)
+                try:
+                    if original_path and original_path.exists() and str(original_path) != result.image_info.local_path:
+                        original_path.unlink(missing_ok=True)
+                except Exception as e:
+                    logger.debug(f"Failed to remove original generated image file {original_path}: {e}")
             
             return result
             
@@ -467,8 +678,64 @@ class ImageService:
         
         try:
             # 获取本地存储提供者
+            # Convert to WebP first to reduce storage usage for any uploaded images
+            processing_cfg = self.config.get("processing", {}) or {}
+            if bool(processing_cfg.get("upload_convert_to_webp", True)):
+                webp_quality = int(processing_cfg.get("upload_webp_quality", processing_cfg.get("default_quality", 80)))
+                webp_quality = max(1, min(100, webp_quality))
+                webp_method = int(processing_cfg.get("upload_webp_method", 6))
+                skip_animated = bool(processing_cfg.get("upload_skip_animated", True))
+                try:
+                    converted_bytes, info = convert_image_bytes_to_webp(
+                        file_data,
+                        quality=webp_quality,
+                        method=webp_method,
+                        skip_if_webp=True,
+                        skip_animated=skip_animated,
+                    )
+                    if info.converted:
+                        original_name = request.filename or "image"
+                        new_filename = f"{Path(original_name).stem}.webp"
+                        request = request.model_copy(
+                            update={
+                                "filename": new_filename,
+                                "content_type": "image/webp",
+                                "file_size": len(converted_bytes),
+                            }
+                        )
+                        file_data = converted_bytes
+                except Exception as e:
+                    logger.warning(f"WebP conversion skipped for upload {request.filename}: {e}")
+
+            # Enforce per-user quota before writing any staging files.
+            user_id = current_user_id.get()
+            quota_mb = (self.cache_manager.config or {}).get("user_quota_mb", 0)
+            try:
+                quota_mb = int(float(quota_mb))
+            except Exception:
+                quota_mb = 0
+
+            if user_id is not None and user_id != USER_SCOPE_ALL and quota_mb > 0:
+                quota_bytes = quota_mb * 1024 * 1024
+
+                # Multi-worker processes: refresh filesystem index so new uploads/deletes are visible across workers.
+                await asyncio.get_event_loop().run_in_executor(None, self.cache_manager._load_cache_index)
+
+                content_hash = hashlib.sha256(file_data).hexdigest()
+                cache_key = f"u{user_id}_{content_hash}"
+                existing = self.cache_manager._cache_index.get(cache_key)
+                if not (existing and Path(existing.file_path).exists()):
+                    used_bytes = await self.cache_manager.get_user_storage_usage_bytes(user_id, refresh_index=False)
+                    if used_bytes + len(file_data) > quota_bytes:
+                        used_mb = used_bytes / (1024 * 1024)
+                        return ImageOperationResult(
+                            success=False,
+                            message=f"存储空间已满：已使用 {used_mb:.1f}MB，单用户上限 {quota_mb}MB。请先删除部分图片再上传。",
+                            error_code="storage_quota_exceeded",
+                        )
+
             storage_providers = provider_registry.get_storage_providers()
-            
+             
             if not storage_providers:
                 return ImageOperationResult(
                     success=False,
@@ -478,15 +745,37 @@ class ImageService:
             
             # 使用第一个可用的存储提供者
             provider = storage_providers[0]
-            
+            staging_path: Optional[Path] = None
+             
             # 上传图片
             result = await provider.upload(request, file_data)
-            
+            if result.success and result.image_info and result.image_info.local_path:
+                try:
+                    staging_path = Path(result.image_info.local_path)
+                except Exception:
+                    staging_path = None
+             
             # 如果上传成功，缓存图片
             if result.success and result.image_info:
-                cache_key = await self.cache_manager.cache_image(result.image_info, file_data)
-                logger.info(f"Uploaded image cached: {cache_key}")
-            
+                try:
+                    cache_key = await self.cache_manager.cache_image(result.image_info, file_data)
+                    logger.info(f"Uploaded image cached: {cache_key}")
+                except StorageQuotaExceededError as e:
+                    used_mb = e.used_bytes / (1024 * 1024)
+                    quota_mb = e.quota_bytes / (1024 * 1024)
+                    return ImageOperationResult(
+                        success=False,
+                        message=f"存储空间已满：已使用 {used_mb:.1f}MB，单用户上限 {quota_mb:.0f}MB。请先删除部分图片再上传。",
+                        error_code="storage_quota_exceeded",
+                    )
+                finally:
+                    # Avoid keeping duplicated staging copies on disk (quota enforcement relies on cache usage).
+                    try:
+                        if staging_path and staging_path.exists() and staging_path.is_file():
+                            staging_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+             
             return result
             
         except Exception as e:
@@ -497,33 +786,144 @@ class ImageService:
                 error_code="upload_error"
             )
     
+    def _artifact_to_image_info(self, artifact) -> Optional[ImageInfo]:
+        """Convert an image_cache artifact row into ImageInfo metadata."""
+        try:
+            metadata = artifact.metadata_json or {}
+            if metadata:
+                image_info = ImageInfo(**metadata)
+                image_info.image_id = image_info.image_id or artifact.task_id or artifact.id
+                image_info.owner_user_id = image_info.owner_user_id or artifact.user_id
+                if not image_info.filename:
+                    image_info.filename = artifact.filename
+                return image_info
+
+            suffix = Path(artifact.filename or "").suffix.lower()
+            format_map = {
+                '.jpg': ImageFormat.JPEG,
+                '.jpeg': ImageFormat.JPEG,
+                '.png': ImageFormat.PNG,
+                '.webp': ImageFormat.WEBP,
+                '.gif': ImageFormat.GIF,
+                '.svg': ImageFormat.SVG,
+            }
+            image_format = format_map.get(suffix, ImageFormat.JPEG)
+            from .models import ImageMetadata
+            return ImageInfo(
+                image_id=artifact.task_id or artifact.id,
+                owner_user_id=artifact.user_id,
+                source_type=ImageSourceType.LOCAL_STORAGE,
+                provider=ImageProvider.LOCAL_STORAGE,
+                original_url="",
+                local_path="",
+                filename=artifact.filename,
+                title=artifact.filename,
+                metadata=ImageMetadata(
+                    width=0,
+                    height=0,
+                    format=image_format,
+                    file_size=int(artifact.size_bytes or 0),
+                ),
+                created_at=float(artifact.created_at or time.time()),
+                updated_at=float(artifact.updated_at or artifact.created_at or time.time()),
+            )
+        except Exception as exc:
+            logger.warning("Failed to convert image artifact %s to ImageInfo: %s", getattr(artifact, 'id', None), exc)
+            return None
+
+    def _artifact_source_type(self, artifact, image_info: Optional[ImageInfo]) -> str:
+        if image_info:
+            try:
+                return image_info.source_type.value
+            except Exception:
+                pass
+        metadata = artifact.metadata_json or {}
+        source_type = metadata.get("source_type") or metadata.get("source") or "local_storage"
+        return str(source_type)
+
+    def _artifact_to_gallery_item(self, artifact, image_info: ImageInfo) -> Dict[str, Any]:
+        from ..url_service import build_image_url
+
+        metadata = image_info.metadata if image_info else None
+        image_id = image_info.image_id if image_info else (artifact.task_id or artifact.id)
+        return {
+            "id": image_id,
+            "image_id": image_id,
+            "title": image_info.title if image_info else artifact.filename,
+            "description": image_info.description if image_info else None,
+            "filename": image_info.filename if image_info else artifact.filename,
+            "url": build_image_url(
+                image_id,
+                width=getattr(metadata, "width", None),
+                height=getattr(metadata, "height", None),
+            ),
+            "file_size": int(artifact.size_bytes or getattr(metadata, "file_size", 0) or 0),
+            "width": getattr(metadata, "width", 0) if metadata else 0,
+            "height": getattr(metadata, "height", 0) if metadata else 0,
+            "source_type": self._artifact_source_type(artifact, image_info),
+            "source": self._artifact_source_type(artifact, image_info),
+            "category": self._artifact_source_type(artifact, image_info),
+            "provider": image_info.provider.value if image_info else "local_storage",
+            "alt_text": (image_info.title or image_info.filename) if image_info else artifact.filename,
+            "created_at": float(artifact.created_at or 0),
+            "last_accessed": float(artifact.updated_at or artifact.created_at or 0),
+            "access_count": 0,
+            "tags": [tag.name if hasattr(tag, 'name') else str(tag) for tag in ((image_info.tags if image_info else []) or [])],
+            "artifact_id": artifact.id,
+            "storage_backend": artifact.storage_backend,
+        }
+
     async def get_image(self, image_id: str) -> Optional[ImageInfo]:
-        """获取图片信息"""
+        """获取图片信息；artifact/S3 为权威存储，本地缓存仅回退。"""
         if not self.initialized:
             await self.initialize()
-        
+
         try:
-            # 首先尝试从缓存获取
-            for cache_key, cache_info in self.cache_manager._cache_index.items():
+            effective_user_id = current_user_id.get()
+            artifact_user_id = None if effective_user_id in (None, USER_SCOPE_ALL) else effective_user_id
+
+            # Authoritative path: image_cache artifact metadata.
+            try:
+                from ..storage import get_artifact_service
+            except Exception:
+                from ..storage import get_artifact_service
+            artifact = await get_artifact_service().get_task_artifact(
+                image_id,
+                artifact_type="image_cache",
+                user_id=artifact_user_id,
+            )
+            if artifact:
+                return self._artifact_to_image_info(artifact)
+
+            # Compatibility fallback: local filesystem cache.
+            cached_result = await self.cache_manager.get_cached_image(image_id)
+            if cached_result:
+                image_info, _ = cached_result
+                if effective_user_id in (None, USER_SCOPE_ALL) or image_info.owner_user_id == effective_user_id:
+                    return image_info
+                return None
+
+            for cache_key in list(self.cache_manager._cache_index.keys()):
                 cached_result = await self.cache_manager.get_cached_image(cache_key)
                 if cached_result:
                     image_info, _ = cached_result
-                    if image_info.image_id == image_id:
+                    if image_info.image_id == image_id and (
+                        effective_user_id in (None, USER_SCOPE_ALL) or image_info.owner_user_id == effective_user_id
+                    ):
                         return image_info
-            
-            # 如果缓存中没有，尝试从存储提供者获取
+
             storage_providers = provider_registry.get_storage_providers()
             for provider in storage_providers:
                 image_info = await provider.get_image(image_id)
                 if image_info:
                     return image_info
-            
+
             return None
-            
+
         except Exception as e:
             logger.error(f"Failed to get image {image_id}: {e}")
             return None
-    
+
     async def process_image(self, image_id: str, options: ImageProcessingOptions) -> ImageOperationResult:
         """处理图片"""
         if not self.initialized:
@@ -539,21 +939,18 @@ class ImageService:
                     error_code="image_not_found"
                 )
             
-            # 获取缓存的图片文件
-            cache_key = await self.cache_manager.is_cached(image_info)
-            if not cache_key:
-                return ImageOperationResult(
-                    success=False,
-                    message=f"Image {image_id} not in cache",
-                    error_code="image_not_cached"
-                )
-            
+            # 获取缓存的图片文件；artifact/S3 为权威存储，必要时按需物化到本地临时文件。
+            cache_key = image_info.image_id or image_id
             cached_result = await self.cache_manager.get_cached_image(cache_key)
+            if not cached_result:
+                legacy_cache_key = await self.cache_manager.is_cached(image_info)
+                if legacy_cache_key:
+                    cached_result = await self.cache_manager.get_cached_image(legacy_cache_key)
             if not cached_result:
                 return ImageOperationResult(
                     success=False,
-                    message=f"Failed to load cached image {image_id}",
-                    error_code="cache_load_error"
+                    message=f"Image {image_id} not available in artifact storage or local cache",
+                    error_code="image_not_cached"
                 )
             
             _, input_path = cached_result
@@ -569,8 +966,15 @@ class ImageService:
                 with open(output_path, 'rb') as f:
                     processed_data = f.read()
                 
-                await self.cache_manager.cache_image(result.image_info, processed_data)
-            
+                try:
+                    await self.cache_manager.cache_image(result.image_info, processed_data)
+                except StorageQuotaExceededError:
+                    return ImageOperationResult(
+                        success=False,
+                        message="存储空间已满：请先删除部分图片再处理。",
+                        error_code="storage_quota_exceeded",
+                    )
+             
             return result
             
         except Exception as e:
@@ -582,8 +986,40 @@ class ImageService:
             )
     
     async def get_cache_stats(self) -> Dict[str, Any]:
-        """获取缓存统计"""
-        return await self.cache_manager.get_cache_stats()
+        """获取图库统计；以 image_cache artifact 记录为准。"""
+        user_id = current_user_id.get()
+        artifact_user_id = None if user_id in (None, USER_SCOPE_ALL) else user_id
+        try:
+            from ..storage import get_artifact_service
+
+            artifacts = await get_artifact_service().list_artifacts(
+                artifact_type="image_cache",
+                user_id=artifact_user_id,
+                limit=None,
+            )
+            source_stats: Dict[str, Dict[str, int]] = {}
+            total_size = 0
+            for artifact in artifacts:
+                image_info = self._artifact_to_image_info(artifact)
+                source_type = self._artifact_source_type(artifact, image_info)
+                size = int(artifact.size_bytes or 0)
+                total_size += size
+                source_stats.setdefault(source_type, {'count': 0, 'size': 0})
+                source_stats[source_type]['count'] += 1
+                source_stats[source_type]['size'] += size
+
+            categories = {key: value['count'] for key, value in source_stats.items()}
+            return {
+                'total_entries': len(artifacts),
+                'total_size_bytes': total_size,
+                'total_size_mb': total_size / (1024 * 1024) if total_size else 0,
+                'categories': categories,
+                'source_stats': source_stats,
+                'storage_backend': 'artifact',
+            }
+        except Exception as exc:
+            logger.warning("Failed to get artifact-backed image stats, falling back to local cache: %s", exc)
+            return await self.cache_manager.get_cache_stats()
 
     async def list_cached_images(self,
                                 page: int = 1,
@@ -591,138 +1027,43 @@ class ImageService:
                                 category: Optional[str] = None,
                                 search: Optional[str] = None,
                                 sort: str = "created_desc") -> Dict[str, Any]:
-        """列出缓存的图片"""
+        """列出图库图片；以 image_cache artifact 记录为准。"""
         if not self.initialized:
             await self.initialize()
 
         try:
-            # 获取所有缓存的图片，包括引用
+            from ..storage import get_artifact_service
+
+            effective_user_id = current_user_id.get()
+            artifact_user_id = None if effective_user_id in (None, USER_SCOPE_ALL) else effective_user_id
+            artifacts = await get_artifact_service().list_artifacts(
+                artifact_type="image_cache",
+                user_id=artifact_user_id,
+                limit=None,
+            )
+
             all_images = []
-            processed_content_hashes = set()
-
-            logger.info(f"Processing {len(self.cache_manager._cache_index)} cached images")
-
-            # 首先处理主要的缓存条目
-            for cache_key, cache_info in self.cache_manager._cache_index.items():
+            for artifact in artifacts:
                 try:
-                    # 检查文件是否存在
-                    file_path = Path(cache_info.file_path)
-                    if not file_path.exists():
-                        logger.warning(f"Cache file not found: {cache_info.file_path}")
-                        continue
-
-                    # 加载图片元数据
-                    image_info = await self.cache_manager._load_image_metadata(cache_key)
+                    image_info = self._artifact_to_image_info(artifact)
                     if not image_info:
-                        logger.warning(f"Failed to load metadata for cache key: {cache_key}")
                         continue
 
-                    # 分类筛选
-                    if category and image_info.source_type.value != category:
+                    # 用户隔离：artifact query 已经按 user_id 过滤；双重校验 metadata。
+                    if artifact_user_id is not None and image_info.owner_user_id not in (None, artifact_user_id):
                         continue
 
-                    # 搜索筛选
-                    if search:
-                        if not self._matches_search_criteria(image_info, search):
-                            continue
+                    source_type = self._artifact_source_type(artifact, image_info)
+                    if category and source_type != category:
+                        continue
+                    if search and not self._matches_search_criteria(image_info, search):
+                        continue
 
-                    # 构建图片信息
-                    from ..url_service import build_image_url
-                    image_data = {
-                        "id": image_info.image_id,  # 添加id字段
-                        "image_id": image_info.image_id,
-                        "title": image_info.title,
-                        "description": image_info.description,
-                        "filename": image_info.filename,
-                        "url": build_image_url(image_info.image_id),  # 使用URL服务生成绝对URL
-                        "file_size": cache_info.file_size,
-                        "width": image_info.metadata.width if image_info.metadata else 0,  # 添加宽度
-                        "height": image_info.metadata.height if image_info.metadata else 0,  # 添加高度
-                        "source_type": image_info.source_type.value,
-                        "source": image_info.source_type.value,  # 添加source字段用于分类
-                        "category": image_info.source_type.value,  # 添加category字段用于分类
-                        "provider": image_info.provider.value,
-                        "alt_text": image_info.title or image_info.filename,  # 添加alt_text
-                        "created_at": cache_info.created_at,
-                        "last_accessed": cache_info.last_accessed,
-                        "access_count": cache_info.access_count,
-                        "tags": [tag.name if hasattr(tag, 'name') else str(tag) for tag in (image_info.tags or [])]
-                    }
-
-                    all_images.append(image_data)
-                    processed_content_hashes.add(cache_key)
-                    logger.debug(f"Successfully processed image: {image_info.image_id}")
-
-                except Exception as e:
-                    logger.warning(f"Failed to process cached image {cache_key}: {e}")
+                    all_images.append(self._artifact_to_gallery_item(artifact, image_info))
+                except Exception as exc:
+                    logger.warning("Failed to process image artifact %s: %s", getattr(artifact, 'id', None), exc)
                     continue
 
-            # 然后处理引用文件
-            references_dir = self.cache_manager.metadata_dir / "references"
-            if references_dir.exists():
-                for reference_file in references_dir.glob("*.json"):
-                    try:
-                        # 从文件名提取内容哈希
-                        filename = reference_file.stem
-                        if '_' in filename:
-                            content_hash = filename.split('_')[0]
-
-                            # 如果这个内容哈希已经处理过，跳过
-                            if content_hash in processed_content_hashes:
-                                continue
-
-                            # 加载引用的图片信息
-                            import json
-                            with open(reference_file, 'r', encoding='utf-8') as f:
-                                metadata = json.load(f)
-
-                            from .models import ImageInfo
-                            image_info = ImageInfo(**metadata)
-
-                            # 分类筛选
-                            if category and image_info.source_type.value != category:
-                                continue
-
-                            # 搜索筛选
-                            if search:
-                                if not self._matches_search_criteria(image_info, search):
-                                    continue
-
-                            # 查找对应的缓存信息
-                            cache_info = self.cache_manager._cache_index.get(content_hash)
-                            if not cache_info:
-                                continue
-
-                            # 构建图片信息
-                            from ..url_service import build_image_url
-                            image_data = {
-                                "id": image_info.image_id,  # 添加id字段
-                                "image_id": image_info.image_id,
-                                "title": image_info.title,
-                                "description": image_info.description,
-                                "filename": image_info.filename,
-                                "url": build_image_url(image_info.image_id),  # 使用URL服务生成绝对URL
-                                "file_size": cache_info.file_size,
-                                "width": image_info.metadata.width if image_info.metadata else 0,  # 添加宽度
-                                "height": image_info.metadata.height if image_info.metadata else 0,  # 添加高度
-                                "source_type": image_info.source_type.value,
-                                "source": image_info.source_type.value,  # 添加source字段用于分类
-                                "category": image_info.source_type.value,  # 添加category字段用于分类
-                                "provider": image_info.provider.value,
-                                "alt_text": image_info.title or image_info.filename,  # 添加alt_text
-                                "created_at": cache_info.created_at,
-                                "last_accessed": cache_info.last_accessed,
-                                "access_count": cache_info.access_count,
-                                "tags": [tag.name if hasattr(tag, 'name') else str(tag) for tag in (image_info.tags or [])]
-                            }
-
-                            all_images.append(image_data)
-
-                    except Exception as e:
-                        logger.warning(f"Failed to process reference file {reference_file}: {e}")
-                        continue
-
-            # 排序
             if sort == "created_desc":
                 all_images.sort(key=lambda x: x["created_at"], reverse=True)
             elif sort == "created_asc":
@@ -734,22 +1075,19 @@ class ImageService:
             elif sort == "size_asc":
                 all_images.sort(key=lambda x: x["file_size"])
 
-            # 分页
             total_count = len(all_images)
             start_idx = (page - 1) * per_page
             end_idx = start_idx + per_page
-            page_images = all_images[start_idx:end_idx]
-
             return {
-                "images": page_images,
-                "total_count": total_count
+                "images": all_images[start_idx:end_idx],
+                "total_count": total_count,
             }
 
         except Exception as e:
-            logger.error(f"Failed to list cached images: {e}")
+            logger.error(f"Failed to list artifact-backed images: {e}")
             return {
                 "images": [],
-                "total_count": 0
+                "total_count": 0,
             }
 
     def _matches_search_criteria(self, image_info: ImageInfo, search: str) -> bool:
@@ -796,28 +1134,52 @@ class ImageService:
         return True
 
     async def delete_image(self, image_id: str) -> bool:
-        """删除图片"""
+        """删除图片；同步删除 artifact 记录和对象，本地缓存仅做 best-effort 清理。"""
         if not self.initialized:
             await self.initialize()
 
         try:
-            # 查找对应的缓存键
-            cache_key = None
-            for key, cache_info in self.cache_manager._cache_index.items():
+            effective_user_id = current_user_id.get()
+            artifact_user_id = None if effective_user_id in (None, USER_SCOPE_ALL) else effective_user_id
+
+            from ..storage import get_artifact_service
+
+            deleted_count = await get_artifact_service().delete_task_artifacts(
+                image_id,
+                artifact_type="image_cache",
+                user_id=artifact_user_id,
+            )
+            if deleted_count:
+                # Remove local compatibility cache without trying to delete the already removed artifact again.
                 try:
-                    image_info = await self.cache_manager._load_image_metadata(key)
-                    if image_info and image_info.image_id == image_id:
-                        cache_key = key
-                        break
+                    await self.cache_manager.remove_from_cache(image_id, delete_artifact=False)
+                except Exception:
+                    pass
+                return True
+
+            # Compatibility fallback for legacy local-only images.
+            if image_id in self.cache_manager._cache_index:
+                image_info = await self.cache_manager._load_image_metadata(image_id)
+                if not image_info:
+                    return False
+                if effective_user_id not in (None, USER_SCOPE_ALL) and image_info.owner_user_id != effective_user_id:
+                    return False
+                await self.cache_manager.remove_from_cache(image_id)
+                return True
+
+            for cache_key in list(self.cache_manager._cache_index.keys()):
+                try:
+                    image_info = await self.cache_manager._load_image_metadata(cache_key)
+                    if not image_info or image_info.image_id != image_id:
+                        continue
+                    if effective_user_id not in (None, USER_SCOPE_ALL) and image_info.owner_user_id != effective_user_id:
+                        return False
+                    await self.cache_manager.remove_from_cache(cache_key)
+                    return True
                 except Exception:
                     continue
 
-            if not cache_key:
-                return False
-
-            # 从缓存中删除
-            await self.cache_manager.remove_from_cache(cache_key)
-            return True
+            return False
 
         except Exception as e:
             logger.error(f"Failed to delete image {image_id}: {e}")
@@ -836,7 +1198,8 @@ class ImageService:
 
             # 生成缩略图路径
             thumbnail_dir = self.cache_manager.thumbnails_dir
-            thumbnail_path = thumbnail_dir / f"{image_id}_thumb.jpg"
+            # Use cache-manager naming so cleanup works (remove_from_cache deletes `{cache_key}.jpg`)
+            thumbnail_path = thumbnail_dir / f"{image_id}.jpg"
 
             # 如果缩略图已存在，直接返回
             if thumbnail_path.exists():
@@ -892,17 +1255,59 @@ class ImageService:
         }
 
     async def clear_all_cache(self) -> int:
-        """清空所有缓存"""
+        """清空全局图库；删除所有 image_cache artifact 对象和记录。"""
         if not self.initialized:
             await self.initialize()
 
         try:
-            # 清空所有缓存
-            deleted_count = await self.cache_manager.clear_cache()
-            logger.info(f"Cleared all cache, deleted {deleted_count} images")
+            from ..storage import get_artifact_service
+
+            deleted_count = await get_artifact_service().delete_artifacts(artifact_type="image_cache")
+            # Best-effort cleanup for legacy local files and thumbnails.
+            try:
+                await self.cache_manager.clear_cache()
+            except Exception:
+                pass
+            logger.info(f"Cleared all image artifacts, deleted {deleted_count} images")
             return deleted_count
         except Exception as e:
-            logger.error(f"Failed to clear all cache: {e}")
+            logger.error(f"Failed to clear all image artifacts: {e}")
+            raise
+
+    async def clear_user_cache(self, user_id: Optional[int] = None) -> int:
+        """清空指定用户作用域下的图库图片；删除 artifact 对象和记录。"""
+        if not self.initialized:
+            await self.initialize()
+
+        effective_user_id = current_user_id.get() if user_id is None else user_id
+        if effective_user_id is None or effective_user_id == USER_SCOPE_ALL:
+            return await self.clear_all_cache()
+
+        try:
+            from ..storage import get_artifact_service
+
+            deleted_count = await get_artifact_service().delete_artifacts(
+                artifact_type="image_cache",
+                user_id=int(effective_user_id),
+            )
+
+            # Best-effort cleanup for local compatibility cache.
+            try:
+                prefix = f"u{effective_user_id}_"
+                for cache_key in list(self.cache_manager._cache_index.keys()):
+                    if cache_key.startswith(prefix):
+                        await self.cache_manager.remove_from_cache(cache_key, delete_artifact=False)
+            except Exception:
+                pass
+
+            logger.info(
+                "Cleared user-scoped image artifacts for user %s, deleted %s images",
+                effective_user_id,
+                deleted_count,
+            )
+            return deleted_count
+        except Exception as e:
+            logger.error(f"Failed to clear user image artifacts for user {effective_user_id}: {e}")
             raise
 
     async def deduplicate_cache(self) -> Dict[str, int]:

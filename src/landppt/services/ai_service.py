@@ -9,6 +9,7 @@ from typing import Dict, Any, List, Optional
 from ..api.models import ChatCompletionRequest, CompletionRequest, PPTGenerationRequest
 from ..ai import get_ai_provider, AIMessage, MessageRole
 from ..core.config import ai_config
+from .prompts.system_prompts import SystemPrompts
 
 logger = logging.getLogger(__name__)
 
@@ -91,12 +92,12 @@ class AIService:
             ))
 
             # Generate response using AI provider
-            response = await self.ai_provider.chat_completion(
-                messages=ai_messages,
-                max_tokens=request.max_tokens or ai_config.max_tokens,
-                temperature=request.temperature or ai_config.temperature,
-                top_p=request.top_p or ai_config.top_p
-            )
+            request_kwargs: Dict[str, Any] = {
+                "messages": ai_messages,
+                "temperature": request.temperature or ai_config.temperature,
+                "top_p": request.top_p or ai_config.top_p,
+            }
+            response = await self.ai_provider.chat_completion(**request_kwargs)
 
             return response.content
 
@@ -111,15 +112,15 @@ class AIService:
             prompt = request.prompt if isinstance(request.prompt, str) else request.prompt[0]
 
             # Create enhanced prompt for PPT generation
-            enhanced_prompt = self._create_ppt_prompt(prompt)
+            enhanced_prompt = SystemPrompts.with_text_cache_prefix(self._create_ppt_prompt(prompt))
 
             # Generate response using AI provider
-            response = await self.ai_provider.text_completion(
-                prompt=enhanced_prompt,
-                max_tokens=request.max_tokens or ai_config.max_tokens,
-                temperature=request.temperature or ai_config.temperature,
-                top_p=request.top_p or ai_config.top_p
-            )
+            request_kwargs: Dict[str, Any] = {
+                "prompt": enhanced_prompt,
+                "temperature": request.temperature or ai_config.temperature,
+                "top_p": request.top_p or ai_config.top_p,
+            }
+            response = await self.ai_provider.text_completion(**request_kwargs)
 
             return response.content
 
@@ -147,12 +148,12 @@ class AIService:
             ))
 
             # Generate response using AI provider
-            response = await self.ai_provider.chat_completion(
-                messages=ai_messages,
-                max_tokens=request.max_tokens or min(ai_config.max_tokens, 1000),  # Use smaller limit for general chat
-                temperature=request.temperature or ai_config.temperature,
-                top_p=request.top_p or ai_config.top_p
-            )
+            request_kwargs: Dict[str, Any] = {
+                "messages": ai_messages,
+                "temperature": request.temperature or ai_config.temperature,
+                "top_p": request.top_p or ai_config.top_p,
+            }
+            response = await self.ai_provider.chat_completion(**request_kwargs)
 
             return response.content
 
@@ -167,15 +168,15 @@ class AIService:
             prompt = request.prompt if isinstance(request.prompt, str) else request.prompt[0]
 
             # Create enhanced prompt for general assistance
-            enhanced_prompt = self._create_general_prompt(prompt)
+            enhanced_prompt = SystemPrompts.with_text_cache_prefix(self._create_general_prompt(prompt))
 
             # Generate response using AI provider
-            response = await self.ai_provider.text_completion(
-                prompt=enhanced_prompt,
-                max_tokens=request.max_tokens or min(ai_config.max_tokens, 1000),  # Use smaller limit for general completion
-                temperature=request.temperature or ai_config.temperature,
-                top_p=request.top_p or ai_config.top_p
-            )
+            request_kwargs: Dict[str, Any] = {
+                "prompt": enhanced_prompt,
+                "temperature": request.temperature or ai_config.temperature,
+                "top_p": request.top_p or ai_config.top_p,
+            }
+            response = await self.ai_provider.text_completion(**request_kwargs)
 
             return response.content
 
@@ -186,7 +187,7 @@ class AIService:
 
     def _get_ppt_system_prompt(self) -> str:
         """Get system prompt for PPT generation"""
-        return """You are LandPPT AI, an expert presentation generation assistant. Your role is to help users create professional, engaging PowerPoint presentations.
+        return SystemPrompts.with_cache_prefix("""You are LandPPT AI, an expert presentation generation assistant. Your role is to help users create professional, engaging PowerPoint presentations.
 
 Key capabilities:
 1. Generate structured PPT outlines with clear sections
@@ -202,11 +203,11 @@ When helping with PPT creation:
 - Include practical tips for presentation delivery
 - Offer to generate specific slide content when requested
 
-Be helpful, professional, and focused on creating high-quality presentations."""
+Be helpful, professional, and focused on creating high-quality presentations.""")
 
     def _get_general_system_prompt(self) -> str:
         """Get system prompt for general assistance"""
-        return """You are LandPPT AI, a helpful assistant specialized in presentation generation. While you can provide general assistance, your primary expertise is in creating professional PowerPoint presentations.
+        return SystemPrompts.with_cache_prefix("""You are LandPPT AI, a helpful assistant specialized in presentation generation. While you can provide general assistance, your primary expertise is in creating professional PowerPoint presentations.
 
 When users ask non-PPT questions:
 - Provide helpful, accurate information
@@ -215,7 +216,7 @@ When users ask non-PPT questions:
 - Maintain a friendly, professional tone
 - Keep responses concise but informative
 
-Your goal is to be helpful while gently guiding users toward your presentation generation capabilities."""
+Your goal is to be helpful while gently guiding users toward your presentation generation capabilities.""")
 
     def _create_ppt_prompt(self, user_prompt: str) -> str:
         """Create enhanced prompt for PPT generation"""
@@ -243,7 +244,7 @@ Provide a helpful response, and if relevant, suggest how this topic could be tur
     async def _generate_fallback_ppt_response(self, prompt: str) -> str:
         """Generate fallback PPT response when AI fails"""
         ppt_info = self._extract_ppt_info(prompt)
-        return await self._generate_guidance_response(ppt_info)
+        return await self._generate_outline_response(ppt_info)
 
     def _generate_fallback_general_response(self, prompt: str) -> str:
         """Generate fallback general response when AI fails"""

@@ -31,7 +31,7 @@ class FileSystemStorageProvider(LocalStorageProvider):
         # 存储配置
         self.base_dir = Path(config.get('base_dir', 'temp/images_cache/local_storage'))
         self.max_file_size = config.get('max_file_size_mb', 50) * 1024 * 1024  # MB to bytes
-        self.supported_formats = config.get('supported_formats', ['jpg', 'jpeg', 'png', 'webp', 'gif'])
+        self.supported_formats = config.get('supported_formats', ['jpg', 'jpeg', 'png', 'webp', 'gif', 'svg'])
         
         # 创建存储目录
         self.base_dir.mkdir(parents=True, exist_ok=True)
@@ -242,7 +242,17 @@ class FileSystemStorageProvider(LocalStorageProvider):
         """创建图片信息"""
         # 检测图片格式
         file_ext = file_path.suffix.lower().lstrip('.')
-        image_format = ImageFormat.PNG if file_ext == 'png' else ImageFormat.JPEG
+        format_map = {
+            'jpg': ImageFormat.JPEG,
+            'jpeg': ImageFormat.JPEG,
+            'png': ImageFormat.PNG,
+            'gif': ImageFormat.GIF,
+            'webp': ImageFormat.WEBP,
+            'bmp': ImageFormat.BMP,
+            'tiff': ImageFormat.TIFF,
+            'svg': ImageFormat.SVG,
+        }
+        image_format = format_map.get(file_ext, ImageFormat.JPEG)
 
         # 获取图片尺寸
         width, height, color_mode, has_transparency = await self._get_image_dimensions(file_path, file_data)
@@ -336,7 +346,17 @@ class FileSystemStorageProvider(LocalStorageProvider):
             image_id = file_path.stem.split('_')[-1] if '_' in file_path.stem else file_path.stem
             
             # 检测图片格式
-            image_format = ImageFormat.PNG if file_ext == 'png' else ImageFormat.JPEG
+            format_map = {
+                'jpg': ImageFormat.JPEG,
+                'jpeg': ImageFormat.JPEG,
+                'png': ImageFormat.PNG,
+                'gif': ImageFormat.GIF,
+                'webp': ImageFormat.WEBP,
+                'bmp': ImageFormat.BMP,
+                'tiff': ImageFormat.TIFF,
+                'svg': ImageFormat.SVG,
+            }
+            image_format = format_map.get(file_ext, ImageFormat.JPEG)
 
             # 获取图片尺寸
             width, height, color_mode, has_transparency = await self._get_image_dimensions(file_path)

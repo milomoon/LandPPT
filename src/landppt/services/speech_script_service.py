@@ -11,10 +11,12 @@ from dataclasses import dataclass
 from enum import Enum
 
 from ..ai.base import AIMessage, MessageRole
-from ..ai.providers import get_ai_provider, get_role_provider
+from ..ai.providers import get_ai_provider, get_role_provider, strip_think_content
 from ..core.config import ai_config
 from ..api.models import PPTProject
+from .prompts.system_prompts import SystemPrompts
 from .progress_tracker import progress_tracker
+from .runtime.ai_execution import scoped_ai_conversation
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +53,7 @@ class LanguageComplexity(str, Enum):
 @dataclass
 class SpeechScriptCustomization:
     """Speech script customization options"""
+    language: str = "zh"
     tone: SpeechTone = SpeechTone.CONVERSATIONAL
     target_audience: TargetAudience = TargetAudience.GENERAL_PUBLIC
     language_complexity: LanguageComplexity = LanguageComplexity.MODERATE
@@ -83,13 +86,123 @@ class SpeechScriptResult:
 class SpeechScriptService:
     """Service for generating AI-powered speech scripts for presentations"""
     
-    def __init__(self):
+    def __init__(self, user_id: Optional[int] = None):
+        self.user_id = user_id
         self.ai_provider = None
         self.provider_settings: Optional[Dict[str, Optional[str]]] = None
+        # Note: _initialize_ai_provider is sync, if user_id is provided,
+        # we need to call initialize_async() after construction
+        if user_id is None:
+            self._initialize_ai_provider()
+
+    async def initialize_async(self):
+        """Async initialization for user-specific AI provider from database"""
+        if self.user_id is not None:
+            await self._initialize_ai_provider_async()
+        else:
+            self._initialize_ai_provider()
+
+    async def _initialize_ai_provider_async(self):
+        """Initialize AI provider from user's database configuration"""
+        from .db_config_service import (
+            get_db_config_service,
+            get_user_ai_provider,
+            get_user_ai_provider_config,
+            get_user_role_provider,
+        )
+
+        # 1) Prefer per-user, per-role configuration (speech_script_model_provider / speech_script_model_name)
+        try:
+            provider, role_settings = await get_user_role_provider(self.user_id, "speech_script")
+            self.ai_provider = provider
+            self.provider_settings = role_settings
+            logger.info(
+                "Initialized speech script AI provider from DB role config: "
+                f"user_id={self.user_id}, provider={role_settings.get('provider')}, model={role_settings.get('model')}"
+            )
+            return
+        except Exception as e:
+            logger.warning(
+                f"Failed to initialize speech script AI provider from DB role config for user {self.user_id}: {e}"
+            )
+
+        # 2) If the configured provider cannot be created (e.g. missing system LandPPT key),
+        # fall back to any working provider from the user's DB settings.
+        try:
+            config_service = get_db_config_service()
+            user_config = await config_service.get_all_config(user_id=self.user_id)
+            system_config = await config_service.get_all_config(user_id=None)
+
+            def _norm_provider(value: Optional[str]) -> Optional[str]:
+                if not value:
+                    return None
+                value = str(value).strip().lower()
+                if value == "gemini":
+                    return "google"
+                return value or None
+
+            requested_role_provider = _norm_provider(user_config.get("speech_script_model_provider"))
+            requested_default_provider = _norm_provider(user_config.get("default_ai_provider"))
+            role_model = (user_config.get("speech_script_model_name") or "").strip() or None
+            enable_local_models = bool(user_config.get("enable_local_models"))
+
+            candidates: List[str] = []
+            for value in (requested_role_provider, requested_default_provider):
+                if value and value not in candidates:
+                    candidates.append(value)
+
+            # Add other likely configured providers (in priority order).
+            if user_config.get("openai_api_key") and "openai" not in candidates:
+                candidates.append("openai")
+            if user_config.get("anthropic_api_key") and "anthropic" not in candidates:
+                candidates.append("anthropic")
+            if user_config.get("google_api_key") and "google" not in candidates:
+                candidates.append("google")
+            # Ollama doesn't require an API key; only try it when local models are enabled.
+            if enable_local_models and "ollama" not in candidates:
+                candidates.append("ollama")
+            # LandPPT requires system credentials; only try if configured.
+            if system_config.get("landppt_api_key") and "landppt" not in candidates:
+                candidates.append("landppt")
+
+            for provider_name in candidates:
+                try:
+                    provider_config = await get_user_ai_provider_config(self.user_id, provider_name=provider_name)
+                    needs_api_key = provider_name not in {"ollama"}
+                    has_api_key = bool(provider_config.get("api_key"))
+                    if needs_api_key and not has_api_key:
+                        logger.info(
+                            f"Skipping provider '{provider_name}' for user {self.user_id}: missing api_key in DB config"
+                        )
+                        continue
+
+                    provider = await get_user_ai_provider(self.user_id, provider_name=provider_name)
+                    model = role_model or provider_config.get("model")
+                    self.ai_provider = provider
+                    self.provider_settings = {
+                        "role": "speech_script",
+                        "provider": provider_name,
+                        "model": model,
+                    }
+                    logger.info(
+                        "Initialized speech script AI provider from DB fallback: "
+                        f"user_id={self.user_id}, provider={provider_name}, model={model}"
+                    )
+                    return
+                except Exception as provider_error:
+                    logger.warning(
+                        f"Failed to initialize provider '{provider_name}' for user {self.user_id}: {provider_error}"
+                    )
+        except Exception as e:
+            logger.warning(f"Failed to select fallback AI provider from DB for user {self.user_id}: {e}")
+
+        # 3) Final fallback to global config (env/.env)
         self._initialize_ai_provider()
 
+
+
     def _initialize_ai_provider(self):
-        """Initialize AI provider"""
+        """Initialize AI provider from global config (fallback)"""
         try:
             provider, settings = get_role_provider("speech_script")
             self.ai_provider = provider
@@ -106,7 +219,9 @@ class SpeechScriptService:
                 logger.error(f"Failed to initialize AI provider: {fallback_error}")
                 self.ai_provider = None
                 self.provider_settings = None
+
     
+    @scoped_ai_conversation("speech-script")
     async def generate_single_slide_script(
         self,
         project: PPTProject,
@@ -171,6 +286,7 @@ class SpeechScriptService:
                 error_message=str(e)
             )
     
+    @scoped_ai_conversation("speech-script")
     async def generate_multi_slide_scripts(
         self,
         project: PPTProject,
@@ -195,6 +311,10 @@ class SpeechScriptService:
             
             scripts = []
             total_duration_seconds = 0
+            existing_script_contexts = await self._load_existing_script_contexts(
+                project.project_id,
+                customization.language,
+            )
             
             for i, slide_index in enumerate(slide_indices):
                 if slide_index >= len(project.slides_data):
@@ -204,20 +324,36 @@ class SpeechScriptService:
                 
                 # Get context from previous slide in the sequence
                 previous_slide_context = ""
+                previous_script_slide_index = None
                 if i > 0:
                     prev_index = slide_indices[i - 1]
                     if prev_index < len(project.slides_data):
                         prev_slide = project.slides_data[prev_index]
                         previous_slide_context = self._extract_slide_context(prev_slide)
+                        previous_script_slide_index = prev_index
                 elif slide_index > 0:
                     # Use actual previous slide if this is the first in selection
                     prev_slide = project.slides_data[slide_index - 1]
                     previous_slide_context = self._extract_slide_context(prev_slide)
+                    previous_script_slide_index = slide_index - 1
+
+                previous_script_context = ""
+                if previous_script_slide_index is not None:
+                    for prev_script in reversed(scripts):
+                        if prev_script.slide_index == previous_script_slide_index:
+                            previous_script_context = self._trim_context_text(
+                                prev_script.script_content,
+                                max_chars=1200,
+                            )
+                            break
+                    previous_script_is_part_of_current_run = previous_script_slide_index in slide_indices[:i]
+                    if not previous_script_context and not previous_script_is_part_of_current_run:
+                        previous_script_context = existing_script_contexts.get(previous_script_slide_index, "")
                 
                 # Generate script
                 script_content = await self._generate_script_for_slide(
                     slide, slide_index, len(project.slides_data),
-                    project, previous_slide_context, customization
+                    project, previous_slide_context, customization, previous_script_context
                 )
                 
                 # Estimate duration
@@ -255,6 +391,7 @@ class SpeechScriptService:
                 error_message=str(e)
             )
     
+    @scoped_ai_conversation("speech-script")
     async def generate_full_presentation_scripts(
         self,
         project: PPTProject,
@@ -290,6 +427,7 @@ class SpeechScriptService:
                 error_message=str(e)
             )
 
+    @scoped_ai_conversation("speech-script")
     async def generate_multi_slide_scripts_with_retry(
         self,
         project: PPTProject,
@@ -312,15 +450,20 @@ class SpeechScriptService:
             successful_scripts = []
             failed_slides = []
             skipped_slides = []
+            existing_script_contexts = await self._load_existing_script_contexts(
+                project.project_id,
+                customization.language,
+            )
 
             # Create progress tracking task
             if not task_id:
                 task_id = str(uuid.uuid4())
 
-            progress_info = progress_tracker.create_task(
+            progress_info = await progress_tracker.create_task_async(
                 task_id=task_id,
                 project_id=project.project_id,
-                total_slides=total_slides
+                total_slides=total_slides,
+                overwrite=False,
             )
 
             # Track progress
@@ -328,17 +471,32 @@ class SpeechScriptService:
 
             for i, slide_index in enumerate(slide_indices):
                 if slide_index >= len(project.slides_data):
+                    fallback_title = f'第{slide_index + 1}页'
                     failed_slides.append({
                         'slide_index': slide_index,
-                        'error': 'Slide index out of range'
+                        'slide_title': fallback_title,
+                        'error': '页码超出范围'
                     })
+                    await progress_tracker.add_slide_failed_async(
+                        task_id,
+                        slide_index,
+                        fallback_title,
+                        '页码超出范围'
+                    )
+                    if progress_callback:
+                        progress_callback({
+                            'type': 'slide_failed',
+                            'slide_index': slide_index,
+                            'slide_title': fallback_title,
+                            'error': '页码超出范围'
+                        })
                     continue
 
                 slide = project.slides_data[slide_index]
                 slide_title = slide.get('title', f'第{slide_index + 1}页')
 
                 # Update progress
-                progress_tracker.update_progress(
+                await progress_tracker.update_progress_async(
                     task_id,
                     current_slide=slide_index,
                     current_slide_title=slide_title,
@@ -362,23 +520,37 @@ class SpeechScriptService:
 
                 for retry_count in range(max_retries):
                     try:
-                        # Get previous slide context for better coherence
+                        # Get previous slide and script context for better coherence.
                         previous_slide_context = ""
-                        if slide_index > 0 and successful_scripts:
-                            # Find the most recent successful script before this slide
+                        previous_script_slide_index = None
+                        if i > 0:
+                            prev_index = slide_indices[i - 1]
+                            if prev_index < len(project.slides_data):
+                                previous_slide_context = self._extract_slide_context(project.slides_data[prev_index])
+                                previous_script_slide_index = prev_index
+                        elif slide_index > 0:
+                            previous_slide_context = self._extract_slide_context(project.slides_data[slide_index - 1])
+                            previous_script_slide_index = slide_index - 1
+
+                        previous_script_context = ""
+                        if previous_script_slide_index is not None and successful_scripts:
+                            # Use only the actual previous page's generated script.
                             for prev_script in reversed(successful_scripts):
-                                if prev_script.slide_index < slide_index:
-                                    prev_content = prev_script.script_content
-                                    if len(prev_content) > 200:
-                                        previous_slide_context = prev_content[-200:]
-                                    else:
-                                        previous_slide_context = prev_content
+                                if prev_script.slide_index == previous_script_slide_index:
+                                    previous_script_context = self._trim_context_text(
+                                        prev_script.script_content,
+                                        max_chars=1200,
+                                    )
                                     break
+                        if previous_script_slide_index is not None and not previous_script_context:
+                            previous_script_is_part_of_current_run = previous_script_slide_index in slide_indices[:i]
+                            if not previous_script_is_part_of_current_run:
+                                previous_script_context = existing_script_contexts.get(previous_script_slide_index, "")
 
                         # Generate script
                         script_content = await self._generate_script_for_slide(
                             slide, slide_index, len(project.slides_data),
-                            project, previous_slide_context, customization
+                            project, previous_slide_context, customization, previous_script_context
                         )
 
                         # Estimate duration
@@ -396,7 +568,7 @@ class SpeechScriptService:
                         completed_count += 1
 
                         # Update progress tracker
-                        progress_tracker.add_slide_completed(task_id, slide_index, slide_title)
+                        await progress_tracker.add_slide_completed_async(task_id, slide_index, slide_title)
 
                         # Update progress callback
                         if progress_callback:
@@ -438,7 +610,7 @@ class SpeechScriptService:
                         })
 
                         # Update progress tracker
-                        progress_tracker.add_slide_failed(task_id, slide_index, slide_title, last_error or 'Unknown error')
+                        await progress_tracker.add_slide_failed_async(task_id, slide_index, slide_title, last_error or 'Unknown error')
 
                         # Update progress callback
                         if progress_callback:
@@ -456,7 +628,7 @@ class SpeechScriptService:
                         })
 
                         # Update progress tracker
-                        progress_tracker.add_slide_skipped(task_id, slide_index, slide_title, 'Max retries exceeded')
+                        await progress_tracker.add_slide_skipped_async(task_id, slide_index, slide_title, 'Max retries exceeded')
 
             # Calculate total duration
             total_duration = self._calculate_total_duration([s.estimated_duration for s in successful_scripts])
@@ -476,7 +648,7 @@ class SpeechScriptService:
             # Final progress update - DO NOT mark as completed here
             # The task will be marked as completed in routes.py after database save
             if not success:
-                progress_tracker.fail_task(task_id, error_message or "生成失败")
+                await progress_tracker.fail_task_async(task_id, error_message or "生成失败")
 
             if progress_callback:
                 progress_callback({
@@ -518,26 +690,55 @@ class SpeechScriptService:
         total_slides: int,
         project: PPTProject,
         previous_slide_context: str,
-        customization: SpeechScriptCustomization
+        customization: SpeechScriptCustomization,
+        previous_script_context: str = ""
     ) -> str:
         """Generate speech script for a single slide using AI"""
+        
+        # Check if AI provider is available
+        if not self.ai_provider:
+            raise RuntimeError("AI provider not initialized. Please check AI configuration and API keys.")
         
         # Create the prompt for speech script generation
         prompt = self._create_speech_script_prompt(
             slide, slide_index, total_slides, project,
-            previous_slide_context, customization
+            previous_slide_context, customization, previous_script_context
         )
         
         # Generate using AI
         response = await self.ai_provider.text_completion(
-            prompt=prompt,
+            prompt=SystemPrompts.with_text_cache_prefix(prompt),
             **self._build_request_kwargs(
-                max_tokens=ai_config.max_tokens,
                 temperature=0.7
             )
         )
-        
-        return response.content.strip()
+
+        # Safety net: strip any leaked model reasoning/think blocks. Not all providers
+        # (e.g. Ollama/Google) filter these, and reasoning must never enter the script.
+        return strip_think_content(response.content or "")
+
+    async def humanize_script(
+        self,
+        original_script: str,
+        customization: SpeechScriptCustomization
+    ) -> str:
+        """将已有演讲稿改写为更自然的口播表达。"""
+
+        if not self.ai_provider:
+            raise RuntimeError("AI provider not initialized. Please check AI configuration and API keys.")
+
+        cleaned_script = (original_script or "").strip()
+        if not cleaned_script:
+            raise ValueError("Original speech script cannot be empty")
+
+        prompt = self._create_humanized_script_prompt(cleaned_script, customization)
+        response = await self.ai_provider.text_completion(
+            prompt=SystemPrompts.with_text_cache_prefix(prompt),
+            **self._build_request_kwargs(
+                temperature=0.55
+            )
+        )
+        return strip_think_content(response.content or "")
     
     def _create_speech_script_prompt(
         self,
@@ -546,18 +747,32 @@ class SpeechScriptService:
         total_slides: int,
         project: PPTProject,
         previous_slide_context: str,
-        customization: SpeechScriptCustomization
+        customization: SpeechScriptCustomization,
+        previous_script_context: str = ""
     ) -> str:
         """Create AI prompt for speech script generation"""
 
         from .prompts.speech_script_prompts import SpeechScriptPrompts
 
+        slides_data = project.slides_data or []
+        if not previous_slide_context and slide_index > 0 and slide_index - 1 < len(slides_data):
+            previous_slide_context = self._extract_slide_context(slides_data[slide_index - 1])
+
+        next_slide_context = ""
+        if slide_index + 1 < len(slides_data):
+            next_slide_context = self._extract_slide_context(slides_data[slide_index + 1])
+
         project_info = {
             'topic': project.topic,
-            'scenario': project.scenario
+            'scenario': project.scenario,
+            'slide_sequence': self._build_slide_sequence_context(slides_data, slide_index),
+            'previous_slide_context': previous_slide_context,
+            'previous_script_context': self._trim_context_text(previous_script_context, max_chars=1200),
+            'next_slide_context': next_slide_context
         }
 
         customization_dict = {
+            'language': getattr(customization, "language", "zh"),
             'tone': customization.tone.value,
             'target_audience': customization.target_audience.value,
             'language_complexity': customization.language_complexity.value,
@@ -569,6 +784,30 @@ class SpeechScriptService:
         return SpeechScriptPrompts.get_single_slide_script_prompt(
             slide, slide_index, total_slides, project_info,
             previous_slide_context, customization_dict
+        )
+
+    def _create_humanized_script_prompt(
+        self,
+        original_script: str,
+        customization: SpeechScriptCustomization
+    ) -> str:
+        """创建演讲稿人话化提示词。"""
+
+        from .prompts.speech_script_prompts import SpeechScriptPrompts
+
+        customization_dict = {
+            'language': getattr(customization, "language", "zh"),
+            'tone': customization.tone.value,
+            'target_audience': customization.target_audience.value,
+            'language_complexity': customization.language_complexity.value,
+            'custom_style_prompt': customization.custom_style_prompt,
+            'include_transitions': customization.include_transitions,
+            'speaking_pace': customization.speaking_pace
+        }
+
+        return SpeechScriptPrompts.get_humanized_script_prompt(
+            original_script,
+            customization_dict
         )
 
     def _get_tone_description(self, tone: SpeechTone) -> str:
@@ -621,6 +860,64 @@ class SpeechScriptService:
             text_content = text_content[:200] + "..."
 
         return f"{title}: {text_content}"
+
+    def _build_slide_sequence_context(
+        self,
+        slides_data: List[Dict[str, Any]],
+        current_index: int,
+        window: int = 2,
+    ) -> str:
+        """Build a compact local outline around the current slide."""
+        if not slides_data:
+            return ""
+
+        start = max(0, current_index - window)
+        end = min(len(slides_data), current_index + window + 1)
+        parts = []
+        for index in range(start, end):
+            slide = slides_data[index] or {}
+            title = (slide.get("title") or f"第{index + 1}页").strip()
+            marker = "当前页" if index == current_index else f"第{index + 1}页"
+            parts.append(f"{marker}：{title}")
+        return "；".join(parts)
+
+    def _trim_context_text(self, text: str, max_chars: int = 1200) -> str:
+        """Trim adjacent script context while preserving its opening and ending."""
+        import re
+
+        normalized = re.sub(r'\s+', ' ', text or '').strip()
+        if not normalized or len(normalized) <= max_chars:
+            return normalized
+
+        head_chars = max_chars // 2
+        tail_chars = max_chars - head_chars
+        return f"{normalized[:head_chars]} ... {normalized[-tail_chars:]}"
+
+    async def _load_existing_script_contexts(self, project_id: str, language: str) -> Dict[int, str]:
+        """Load existing saved scripts for adjacent-context fallback."""
+        if not project_id:
+            return {}
+
+        repo = None
+        try:
+            from .speech_script_repository import SpeechScriptRepository
+
+            repo = SpeechScriptRepository()
+            scripts = await repo.get_current_speech_scripts_by_project(
+                project_id,
+                language=language or "zh",
+            )
+            return {
+                int(script.slide_index): self._trim_context_text(script.script_content, max_chars=1200)
+                for script in scripts
+                if getattr(script, "script_content", None)
+            }
+        except Exception as exc:
+            logger.warning(f"Failed to load existing speech scripts for context: {exc}")
+            return {}
+        finally:
+            if repo:
+                repo.close()
 
     def _estimate_speaking_duration(self, script_content: str) -> str:
         """Estimate speaking duration based on script length"""
@@ -732,6 +1029,7 @@ class SpeechScriptService:
         }
 
         customization_dict = {
+            'language': getattr(customization, "language", "zh"),
             'tone': customization.tone.value,
             'target_audience': customization.target_audience.value,
             'language_complexity': customization.language_complexity.value
@@ -742,14 +1040,13 @@ class SpeechScriptService:
         )
 
         response = await self.ai_provider.text_completion(
-            prompt=prompt,
+            prompt=SystemPrompts.with_text_cache_prefix(prompt),
             **self._build_request_kwargs(
-                max_tokens=ai_config.max_tokens // 2,
                 temperature=0.7
             )
         )
 
-        return response.content.strip()
+        return strip_think_content(response.content or "")
 
     async def _generate_closing_remarks(
         self,
@@ -766,6 +1063,7 @@ class SpeechScriptService:
         }
 
         customization_dict = {
+            'language': getattr(customization, "language", "zh"),
             'tone': customization.tone.value,
             'target_audience': customization.target_audience.value,
             'language_complexity': customization.language_complexity.value
@@ -776,17 +1074,16 @@ class SpeechScriptService:
         )
 
         response = await self.ai_provider.text_completion(
-            prompt=prompt,
+            prompt=SystemPrompts.with_text_cache_prefix(prompt),
             **self._build_request_kwargs(
-                max_tokens=ai_config.max_tokens // 2,
                 temperature=0.7
             )
         )
+
+        return strip_think_content(response.content or "")
 
     def _build_request_kwargs(self, **kwargs) -> Dict[str, Any]:
         """Merge base kwargs with role-specific model override if configured."""
         if self.provider_settings and self.provider_settings.get("model"):
             kwargs.setdefault("model", self.provider_settings["model"])
         return kwargs
-
-        return response.content.strip()

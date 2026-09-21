@@ -1,16 +1,5 @@
-"""
-Database package for LandPPT
-"""
-
-from .database import engine, SessionLocal, get_db, init_db, get_async_db
-from .models import Project, TodoBoard, TodoStage, ProjectVersion, SlideData, PPTTemplate
-from .migrations import migration_manager
-from .health_check import health_checker
-from .service import DatabaseService
-from .repositories import (
-    ProjectRepository, TodoBoardRepository, TodoStageRepository,
-    ProjectVersionRepository, SlideDataRepository, PPTTemplateRepository
-)
+from importlib import import_module
+from typing import Any
 
 __all__ = [
     'engine',
@@ -24,6 +13,7 @@ __all__ = [
     'ProjectVersion',
     'SlideData',
     'PPTTemplate',
+    'Notification',
     'migration_manager',
     'health_checker',
     'DatabaseService',
@@ -32,5 +22,52 @@ __all__ = [
     'TodoStageRepository',
     'ProjectVersionRepository',
     'SlideDataRepository',
-    'PPTTemplateRepository'
+    'PPTTemplateRepository',
+    'NotificationRepository'
 ]
+
+
+def __getattr__(name: str) -> Any:
+    """
+    Lazy attribute loader.
+
+    Importing this package should not eagerly create DB engines (which can require optional drivers
+    like psycopg2). Import the underlying submodules on demand instead.
+    """
+    if name in {"engine", "SessionLocal", "get_db", "get_async_db", "init_db"}:
+        module = import_module(".database", __name__)
+        return getattr(module, name)
+
+    if name in {"Project", "TodoBoard", "TodoStage", "ProjectVersion", "SlideData", "PPTTemplate", "Notification"}:
+        module = import_module(".models", __name__)
+        return getattr(module, name)
+
+    if name == "migration_manager":
+        module = import_module(".migrations", __name__)
+        return getattr(module, name)
+
+    if name == "health_checker":
+        module = import_module(".health_check", __name__)
+        return getattr(module, name)
+
+    if name == "DatabaseService":
+        module = import_module(".service", __name__)
+        return getattr(module, name)
+
+    if name in {
+        "ProjectRepository",
+        "TodoBoardRepository",
+        "TodoStageRepository",
+        "ProjectVersionRepository",
+        "SlideDataRepository",
+        "PPTTemplateRepository",
+        "NotificationRepository",
+    }:
+        module = import_module(".repositories", __name__)
+        return getattr(module, name)
+
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:
+    return sorted(__all__)

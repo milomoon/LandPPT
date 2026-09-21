@@ -222,6 +222,10 @@ class ImageRequirement:
     purpose: ImagePurpose            # 图片用途
     description: str                 # 需求描述
     priority: int = 1                # 优先级 (1-5, 5最高)
+    search_keywords: Optional[str] = None    # 一次规划中生成的本地/网络搜索关键词
+    width: Optional[int] = None              # AI生成图片宽度
+    height: Optional[int] = None             # AI生成图片高度
+    generation_prompts: Optional[List[str]] = None  # AI生成图片提示词列表
     
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典格式"""
@@ -230,7 +234,11 @@ class ImageRequirement:
             "count": self.count,
             "purpose": self.purpose.value,
             "description": self.description,
-            "priority": self.priority
+            "priority": self.priority,
+            "search_keywords": self.search_keywords,
+            "width": self.width,
+            "height": self.height,
+            "generation_prompts": self.generation_prompts or []
         }
 
 

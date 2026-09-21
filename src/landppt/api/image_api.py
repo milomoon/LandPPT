@@ -18,10 +18,14 @@ import zipfile
 import io
 import time
 from pathlib import Path
+import aiohttp
 
 from ..services.image.image_service import get_image_service
-from ..services.image.config.image_config import get_image_config
+from ..services.image.config.image_config import get_image_config, ImageServiceConfig
+from ..services.db_config_service import get_db_config_service
+from ..services.storage import get_artifact_service
 from ..auth.middleware import get_current_user_required
+from ..auth.request_context import current_user_id, USER_SCOPE_ALL
 from ..database.models import User
 from ..utils.thread_pool import run_blocking_io, to_thread
 
@@ -30,10 +34,46 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
+async def _get_image_cache_artifact(image_id: str, user_id: Optional[int] = None):
+    return await get_artifact_service().get_task_artifact(
+        image_id,
+        artifact_type="image_cache",
+        user_id=user_id,
+    )
+
+
+async def _stream_artifact_response(artifact, *, attachment: bool = False):
+    disposition = "attachment" if attachment else "inline"
+    return StreamingResponse(
+        get_artifact_service().open_stream(artifact),
+        media_type=artifact.content_type or "application/octet-stream",
+        headers={"Content-Disposition": f'{disposition}; filename="{artifact.filename}"'},
+    )
+
+
+async def _read_artifact_bytes(artifact) -> bytes:
+    chunks = []
+    async for chunk in get_artifact_service().open_stream(artifact):
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 class ImageGenerationRequest(BaseModel):
     prompt: str
     provider: Optional[str] = None
     size: Optional[str] = None
+    width: Optional[int] = None
+    height: Optional[int] = None
+    quality: Optional[str] = None
+    style: Optional[str] = None
+
+
+class ImageTestGenerateRequest(BaseModel):
+    provider: Optional[str] = None
+    prompt: Optional[str] = None
+    size: Optional[str] = None
+    width: Optional[int] = None
+    height: Optional[int] = None
     quality: Optional[str] = None
     style: Optional[str] = None
 
@@ -45,47 +85,143 @@ class ImageSuggestionRequest(BaseModel):
     topic: str
 
 
+def _parse_image_dimensions(
+    size: Optional[str],
+    width: Optional[int],
+    height: Optional[int],
+    *,
+    default_width: int = 1024,
+    default_height: int = 1024,
+) -> tuple[int, int]:
+    """Resolve image dimensions from width/height or a WIDTHxHEIGHT string."""
+    try:
+        if width and height and int(width) > 0 and int(height) > 0:
+            return int(width), int(height)
+    except (TypeError, ValueError):
+        pass
+
+    if size:
+        normalized = str(size).lower().replace("×", "x").strip()
+        try:
+            parsed_width, parsed_height = [int(part.strip()) for part in normalized.split("x", 1)]
+            if parsed_width > 0 and parsed_height > 0:
+                return parsed_width, parsed_height
+        except (TypeError, ValueError):
+            pass
+
+    return default_width, default_height
+
+
+def _parse_generation_provider(provider_name: Optional[str], *, strict: bool = False):
+    from ..services.image.models import ImageProvider
+
+    if provider_name:
+        try:
+            return ImageProvider(provider_name)
+        except ValueError:
+            if strict:
+                raise HTTPException(status_code=400, detail=f"Unsupported image generation provider: {provider_name}")
+            logger.warning("Unsupported image generation provider requested: %s", provider_name)
+    return ImageProvider.DALLE
+
+
+def _get_result_image_url(result) -> Optional[str]:
+    if not getattr(result, "image_info", None):
+        return None
+
+    from ..services.url_service import build_image_url
+
+    metadata = getattr(result.image_info, "metadata", None)
+    return build_image_url(
+        result.image_info.image_id,
+        width=getattr(metadata, "width", None),
+        height=getattr(metadata, "height", None),
+    )
+
+
+def _image_generation_response(result, provider, width: int, height: int) -> Dict[str, Any]:
+    image_info = getattr(result, "image_info", None)
+    if result.success:
+        return {
+            "success": True,
+            "image_path": _get_result_image_url(result),
+            "image_id": image_info.image_id if image_info else None,
+            "provider": provider.value if hasattr(provider, "value") else str(provider),
+            "width": width,
+            "height": height,
+            "message": result.message,
+        }
+
+    return {
+        "success": False,
+        "message": result.message,
+        "error_code": result.error_code,
+        "provider": provider.value if hasattr(provider, "value") else str(provider),
+        "width": width,
+        "height": height,
+    }
+
+
 @router.get("/api/image/status")
 async def get_image_service_status(
     user: User = Depends(get_current_user_required)
 ):
     """获取图片服务状态"""
     try:
-        image_config = get_image_config()
-        config = image_config.get_config()
+        config_manager = ImageServiceConfig()
+        await config_manager.load_config_from_db_async(user.id)
+        config = config_manager.get_config()
+
+        db_config_service = get_db_config_service()
+        image_settings = await db_config_service.get_config_by_category('image_service', user_id=user.id)
+        enable_image_service = image_settings.get('enable_image_service', False)
+        enable_local_images = image_settings.get('enable_local_images', False)
+        enable_network_search = image_settings.get('enable_network_search', False)
+        enable_ai_generation = image_settings.get('enable_ai_generation', False)
         
         # 检查可用的提供者
         available_providers = []
 
+        if enable_local_images:
+            available_providers.append('local')
+
         # 检查DALL-E
-        if config.get('dalle', {}).get('api_key'):
+        if enable_ai_generation and config.get('dalle', {}).get('api_key'):
             available_providers.append('dalle')
 
         # 检查Stable Diffusion
-        if config.get('stable_diffusion', {}).get('api_key'):
+        if enable_ai_generation and config.get('stable_diffusion', {}).get('api_key'):
             available_providers.append('stable_diffusion')
 
         # 检查SiliconFlow
-        if config.get('siliconflow', {}).get('api_key'):
+        if enable_ai_generation and config.get('siliconflow', {}).get('api_key'):
             available_providers.append('siliconflow')
 
         # 检查Gemini图片生成
-        if config.get('gemini', {}).get('api_key'):
+        if enable_ai_generation and config.get('gemini', {}).get('api_key'):
             available_providers.append('gemini')
 
-        # 检查OpenAI图片生成（自定义端点）
-        if config.get('openai_image', {}).get('api_key'):
-            available_providers.append('openai_image')
+        # 检查Pollinations图片生成
+        if enable_ai_generation and config.get('pollinations', {}).get('api_key'):
+            available_providers.append('pollinations')
 
-        # 检查Pollinations（免费服务，总是可用）
-        available_providers.append('pollinations')
+        # 检查OpenAI图片生成（自定义端点）
+        if enable_ai_generation and config.get('openai_image', {}).get('api_key'):
+            available_providers.append('openai_image')
         
         # 检查搜索服务
         search_providers = []
-        if config.get('unsplash', {}).get('access_key'):
-            search_providers.append('unsplash')
-        if config.get('pixabay', {}).get('api_key'):
-            search_providers.append('pixabay')
+        if enable_network_search:
+            if config.get('unsplash', {}).get('api_key'):
+                search_providers.append('unsplash')
+            if config.get('pixabay', {}).get('api_key'):
+                search_providers.append('pixabay')
+            if config.get('searxng', {}).get('host'):
+                search_providers.append('searxng')
+
+        for provider in search_providers:
+            if provider not in available_providers:
+                available_providers.append(provider)
         
         # 检查缓存目录
         cache_dir = Path(config.get('cache', {}).get('base_dir', 'temp/images_cache'))
@@ -106,17 +242,55 @@ async def get_image_service_status(
             except Exception as e:
                 logger.warning(f"Failed to get cache info: {e}")
         
+        status = "ok" if enable_image_service and available_providers else "no_providers"
+        if not enable_image_service:
+            status = "disabled"
+
         return {
-            "status": "ok" if available_providers else "no_providers",
+            "status": status,
             "available_providers": available_providers,
             "search_providers": search_providers,
             "cache_info": cache_info,
-            "message": f"Found {len(available_providers)} image generation providers and {len(search_providers)} search providers"
+            "message": f"Found {len(available_providers)} image providers and {len(search_providers)} search providers"
         }
         
     except Exception as e:
         logger.error(f"Failed to get image service status: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to get image service status: {str(e)}")
+
+
+@router.get("/api/image/pollinations/models")
+async def get_pollinations_image_models(
+    user: User = Depends(get_current_user_required)
+):
+    """获取 Pollinations 图片模型列表（/image/models）"""
+    try:
+        config_manager = ImageServiceConfig()
+        await config_manager.load_config_from_db_async(user.id)
+        config = (config_manager.get_config() or {}).get('pollinations', {}) or {}
+
+        api_base = (config.get('api_base') or 'https://gen.pollinations.ai').rstrip('/')
+        api_key = (config.get('api_key') or '').strip()
+        if not api_key:
+            raise HTTPException(status_code=400, detail="Pollinations API key not configured")
+
+        url = f"{api_base}/image/models"
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+            async with session.get(url, headers={'Authorization': f'Bearer {api_key}'}) as response:
+                if response.status != 200:
+                    body = await response.text()
+                    raise HTTPException(status_code=502, detail=f"Pollinations API error: HTTP {response.status}: {body}")
+                models = await response.json()
+
+        return {
+            "success": True,
+            "models": models
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to fetch Pollinations image models: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch Pollinations image models: {str(e)}")
 
 
 @router.post("/api/image/test")
@@ -189,17 +363,24 @@ async def test_image_service(
                 "message": "SiliconFlow API密钥未配置"
             }
 
-        # 测试Pollinations（免费服务）
-        try:
-            test_results["providers"]["pollinations"] = {
-                "available": True,
-                "message": "Pollinations服务可用（免费服务）"
-            }
-        except Exception as e:
+        # 测试Pollinations
+        if config.get('pollinations', {}).get('api_key'):
+            try:
+                test_results["providers"]["pollinations"] = {
+                    "available": True,
+                    "message": "Pollinations API密钥已配置"
+                }
+            except Exception as e:
+                test_results["providers"]["pollinations"] = {
+                    "available": False,
+                    "message": f"Pollinations测试失败: {str(e)}"
+                }
+        else:
             test_results["providers"]["pollinations"] = {
                 "available": False,
-                "message": f"Pollinations测试失败: {str(e)}"
+                "message": "Pollinations API密钥未配置"
             }
+
 
         # 测试缓存
         cache_dir = Path(config.get('cache', {}).get('base_dir', 'temp/images_cache'))
@@ -227,6 +408,80 @@ async def test_image_service(
     except Exception as e:
         logger.error(f"Image service test failed: {e}")
         raise HTTPException(status_code=500, detail=f"Image service test failed: {str(e)}")
+
+
+@router.post("/api/image/test-generate")
+async def test_generate_image(
+    request: ImageTestGenerateRequest,
+    user: User = Depends(get_current_user_required),
+):
+    """生成一张测试图片，用于验证当前用户的图片生成配置。"""
+    try:
+        db_config_service = get_db_config_service()
+        image_settings = await db_config_service.get_config_by_category('image_service', user_id=user.id)
+
+        if not image_settings.get('enable_image_service'):
+            raise HTTPException(status_code=400, detail="图片服务未启用")
+        if not image_settings.get('enable_ai_generation'):
+            raise HTTPException(status_code=400, detail="AI图片生成未启用")
+
+        provider_name = request.provider or image_settings.get('default_ai_image_provider') or 'dalle'
+        provider = _parse_generation_provider(provider_name, strict=True)
+
+        config_manager = ImageServiceConfig()
+        await config_manager.load_config_from_db_async(user.id)
+        config = config_manager.get_config() or {}
+        provider_config = config.get(provider.value, {}) or {}
+
+        api_key = provider_config.get('api_key')
+        if api_key is not None and not str(api_key).strip():
+            raise HTTPException(status_code=400, detail=f"{provider.value} API key not configured")
+
+        default_width, default_height = _parse_image_dimensions(
+            provider_config.get('default_size'),
+            provider_config.get('default_width'),
+            provider_config.get('default_height'),
+        )
+        width, height = _parse_image_dimensions(
+            request.size,
+            request.width,
+            request.height,
+            default_width=default_width,
+            default_height=default_height,
+        )
+
+        prompt = (
+            request.prompt
+            or "A clean modern presentation test image, abstract business technology background, high quality"
+        )
+
+        from ..services.image.models import ImageGenerationRequest as ServiceImageGenerationRequest
+
+        service_request = ServiceImageGenerationRequest(
+            prompt=prompt,
+            provider=provider,
+            width=width,
+            height=height,
+            quality=request.quality or provider_config.get('default_quality') or "standard",
+            style=request.style or provider_config.get('default_style'),
+        )
+
+        image_service = get_image_service()
+        await image_service.reload_providers_for_user(user.id)
+        result = await image_service.generate_image(service_request)
+
+        response = _image_generation_response(result, provider, width, height)
+        response["prompt"] = prompt
+        if not result.success:
+            return response
+        response["message"] = result.message or "测试图片生成成功"
+        return response
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Test image generation failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Test image generation failed: {str(e)}")
 
 
 @router.post("/api/image/cache/clear")
@@ -303,25 +558,13 @@ async def generate_image(
     """生成图片"""
     try:
         image_service = get_image_service()
+        # Ensure per-user provider keys (DB) are loaded before generating.
+        await image_service.reload_providers_for_user(user.id)
 
-        # 创建图片生成请求对象
-        from ..services.image.models import ImageGenerationRequest as ServiceImageGenerationRequest, ImageProvider
+        from ..services.image.models import ImageGenerationRequest as ServiceImageGenerationRequest
 
-        # 解析尺寸
-        width, height = 1024, 1024
-        if request.size:
-            try:
-                width, height = map(int, request.size.split('x'))
-            except ValueError:
-                width, height = 1024, 1024
-
-        # 解析提供者
-        provider = ImageProvider.DALLE
-        if request.provider:
-            try:
-                provider = ImageProvider(request.provider)
-            except ValueError:
-                provider = ImageProvider.DALLE
+        width, height = _parse_image_dimensions(request.size, request.width, request.height)
+        provider = _parse_generation_provider(request.provider)
 
         service_request = ServiceImageGenerationRequest(
             prompt=request.prompt,
@@ -335,26 +578,7 @@ async def generate_image(
         # 生成图片
         result = await image_service.generate_image(service_request)
 
-        if result.success:
-            # 返回通过本地图床服务可访问的图片URL（绝对地址）
-            if result.image_info:
-                from ..services.url_service import build_image_url
-                image_url = build_image_url(result.image_info.image_id)
-            else:
-                image_url = None
-
-            return {
-                "success": True,
-                "image_path": image_url,
-                "image_id": result.image_info.image_id if result.image_info else None,
-                "message": result.message
-            }
-        else:
-            return {
-                "success": False,
-                "message": result.message,
-                "error_code": result.error_code
-            }
+        return _image_generation_response(result, provider, width, height)
 
     except Exception as e:
         logger.error(f"Image generation failed: {e}")
@@ -524,7 +748,11 @@ async def get_image_info(
 
         # 构建绝对URL
         from ..services.url_service import build_image_url
-        absolute_url = build_image_url(image_id)
+        absolute_url = build_image_url(
+            image_id,
+            width=image_info.metadata.width,
+            height=image_info.metadata.height,
+        )
 
         return {
             "success": True,
@@ -556,6 +784,10 @@ async def view_image(
 ):
     """查看图片"""
     try:
+        artifact = await _get_image_cache_artifact(image_id)
+        if artifact:
+            return await _stream_artifact_response(artifact)
+
         image_service = get_image_service()
         image_info = await image_service.get_image(image_id)
 
@@ -596,7 +828,11 @@ async def get_image_thumbnail(
                 media_type="image/jpeg"
             )
 
-        # 如果没有缩略图，返回原图
+        # 如果没有缩略图，返回原图 artifact/S3 对象
+        artifact = await _get_image_cache_artifact(image_id)
+        if artifact:
+            return await _stream_artifact_response(artifact)
+
         image_info = await image_service.get_image(image_id)
         if image_info and image_info.local_path and Path(image_info.local_path).exists():
             return FileResponse(
@@ -622,6 +858,10 @@ async def download_image(
     try:
         image_service = get_image_service()
         image_info = await image_service.get_image(image_id)
+
+        artifact = await _get_image_cache_artifact(image_id, user_id=user.id)
+        if artifact:
+            return await _stream_artifact_response(artifact, attachment=True)
 
         if not image_info or not image_info.local_path:
             raise HTTPException(status_code=404, detail="Image not found")
@@ -725,30 +965,50 @@ async def batch_download_images(
         image_service = get_image_service()
 
         # 获取所有图片信息
-        image_infos = []
-        for image_id in request.image_ids:
-            try:
-                image_info = await image_service.get_image(image_id)
-                if image_info and image_info.local_path:
-                    image_path = Path(image_info.local_path)
-                    if image_path.exists():
-                        image_infos.append({
-                            'path': str(image_path),
-                            'filename': image_info.filename
-                        })
-            except Exception as e:
-                logger.warning(f"Failed to get image {image_id}: {e}")
-                continue
+        zip_buffer = io.BytesIO()
+        added_count = 0
+        used_names = set()
+        artifact_service = get_artifact_service()
 
-        # 在线程池中创建ZIP文件
-        zip_data = await run_blocking_io(_create_zip_sync, image_infos)
+        def safe_zip_name(name: str, fallback: str) -> str:
+            candidate = os.path.basename(name or fallback) or fallback
+            stem, ext = os.path.splitext(candidate)
+            unique = candidate
+            index = 2
+            while unique in used_names:
+                unique = f"{stem}-{index}{ext}"
+                index += 1
+            used_names.add(unique)
+            return unique
 
-        # 生成文件名
+        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+            for image_id in request.image_ids:
+                try:
+                    artifact = await artifact_service.get_task_artifact(image_id, artifact_type="image_cache", user_id=user.id)
+                    if artifact:
+                        zip_file.writestr(safe_zip_name(artifact.filename, image_id), await _read_artifact_bytes(artifact))
+                        added_count += 1
+                        continue
+
+                    image_info = await image_service.get_image(image_id)
+                    if image_info and image_info.local_path:
+                        image_path = Path(image_info.local_path)
+                        if image_path.exists():
+                            zip_file.write(str(image_path), safe_zip_name(image_info.filename, image_path.name))
+                            added_count += 1
+                except Exception as e:
+                    logger.warning(f"Failed to get image {image_id}: {e}")
+                    continue
+
+        if added_count == 0:
+            raise HTTPException(status_code=404, detail="No downloadable images found")
+
+        zip_buffer.seek(0)
         timestamp = int(time.time())
         filename = f"images_{timestamp}.zip"
 
         return StreamingResponse(
-            io.BytesIO(zip_data),
+            io.BytesIO(zip_buffer.read()),
             media_type="application/zip",
             headers={"Content-Disposition": f"attachment; filename=\"{filename}\""}
         )
@@ -925,11 +1185,14 @@ async def deduplicate_gallery(
 async def clear_all_images(
     user: User = Depends(get_current_user_required)
 ):
-    """清空图床 - 删除所有图片"""
+    """清空当前用户图床；仅管理员可显式触发全局清空。"""
     try:
         image_service = get_image_service()
+        is_global_clear = bool(
+            getattr(user, "is_admin", False) and current_user_id.get() == USER_SCOPE_ALL
+        )
 
-        # 获取所有图片的统计信息
+        # 获取当前作用域内的图片统计信息
         stats = await image_service.get_cache_stats()
         total_images = stats.get('total_entries', 0)
 
@@ -937,16 +1200,21 @@ async def clear_all_images(
             return {
                 "success": True,
                 "deleted_count": 0,
-                "message": "图床已经是空的"
+                "message": "图库已经是空的" if is_global_clear else "你的图库已经是空的"
             }
 
-        # 清空所有缓存
-        deleted_count = await image_service.clear_all_cache()
+        # 普通用户只能清空自己的图库；全局清空仅保留给显式 admin/system 作用域。
+        if is_global_clear:
+            deleted_count = await image_service.clear_all_cache()
+            message = f"成功清空全局图库，删除了 {deleted_count} 张图片"
+        else:
+            deleted_count = await image_service.clear_user_cache(user.id)
+            message = f"成功清空你的图库，删除了 {deleted_count} 张图片"
 
         return {
             "success": True,
             "deleted_count": deleted_count,
-            "message": f"成功清空图床，删除了 {deleted_count} 张图片"
+            "message": message
         }
 
     except Exception as e:

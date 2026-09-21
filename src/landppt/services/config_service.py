@@ -5,6 +5,7 @@ Configuration management service for LandPPT
 import os
 import json
 import logging
+import tempfile
 from typing import Dict, Any, Optional, List
 from pathlib import Path
 from dotenv import load_dotenv, set_key, unset_key
@@ -37,26 +38,22 @@ class ConfigService:
             "openai_api_key": {"type": "password", "category": "ai_providers"},
             "openai_base_url": {"type": "url", "category": "ai_providers", "default": "https://api.openai.com/v1"},
             "openai_model": {"type": "select", "category": "ai_providers", "default": "gpt-4.1"},
+            "openai_use_responses_api": {"type": "boolean", "category": "ai_providers", "default": "false"},
+            "openai_enable_reasoning": {"type": "boolean", "category": "ai_providers", "default": "false"},
+            "openai_reasoning_effort": {"type": "select", "category": "ai_providers", "default": "medium"},
             
             "anthropic_api_key": {"type": "password", "category": "ai_providers"},
+            "anthropic_base_url": {"type": "url", "category": "ai_providers", "default": "https://api.anthropic.com"},
             "anthropic_model": {"type": "select", "category": "ai_providers", "default": "claude-3.5-haiku-20240307"},
+            "anthropic_enable_reasoning": {"type": "boolean", "category": "ai_providers", "default": "false"},
+            "anthropic_reasoning_effort": {"type": "select", "category": "ai_providers", "default": "high"},
 
             "google_api_key": {"type": "password", "category": "ai_providers"},
             "google_base_url": {"type": "url", "category": "ai_providers", "default": "https://generativelanguage.googleapis.com"},
             "google_model": {"type": "text", "category": "ai_providers", "default": "gemini-2.5-flash"},
             
-            "azure_openai_api_key": {"type": "password", "category": "ai_providers"},
-            "azure_openai_endpoint": {"type": "url", "category": "ai_providers"},
-            "azure_openai_deployment_name": {"type": "text", "category": "ai_providers"},
-            "azure_openai_api_version": {"type": "text", "category": "ai_providers", "default": "gpt-4.1"},
-            
             "ollama_base_url": {"type": "url", "category": "ai_providers", "default": "http://localhost:11434"},
             "ollama_model": {"type": "text", "category": "ai_providers", "default": "llama2"},
-            
-            # 302.AI Configuration
-            "302ai_api_key": {"type": "password", "category": "ai_providers"},
-            "302ai_base_url": {"type": "url", "category": "ai_providers", "default": "https://api.302.ai/v1"},
-            "302ai_model": {"type": "text", "category": "ai_providers", "default": "gpt-4o"},
             
             "default_ai_provider": {"type": "select", "category": "ai_providers", "default": "openai"},
             
@@ -79,17 +76,36 @@ class ConfigService:
             "speech_script_model_name": {"type": "text", "category": "model_roles", "default": ""},
             "vision_analysis_model_provider": {"type": "select", "category": "model_roles", "default": ""},
             "vision_analysis_model_name": {"type": "text", "category": "model_roles", "default": ""},
+            "polish_model_provider": {"type": "select", "category": "model_roles", "default": ""},
+            "polish_model_name": {"type": "text", "category": "model_roles", "default": ""},
             
             # Generation Parameters
             "max_tokens": {"type": "number", "category": "generation_params", "default": "16384"},
             "temperature": {"type": "number", "category": "generation_params", "default": "0.7"},
             "top_p": {"type": "number", "category": "generation_params", "default": "1.0"},
-            
+            "llm_timeout_seconds": {"type": "number", "category": "generation_params", "default": "600"},
+            "comfyui_base_url": {"type": "url", "category": "generation_params", "default": "http://127.0.0.1:8188"},
+            "comfyui_tts_workflow_path": {"type": "text", "category": "generation_params", "default": "tests/Qwen3-TD-TTS.json"},
+            "comfyui_tts_timeout_seconds": {"type": "number", "category": "generation_params", "default": "600"},
+            "comfyui_tts_chunk_chars": {"type": "number", "category": "generation_params", "default": "120"},
+            "comfyui_tts_force_precision": {"type": "text", "category": "generation_params", "default": ""},
+            "mimo_api_key": {"type": "password", "category": "generation_params", "default": ""},
+            "mimo_base_url": {"type": "url", "category": "generation_params", "default": "https://api.xiaomimimo.com/v1"},
+            "mimo_tts_model": {"type": "text", "category": "generation_params", "default": "mimo-v2.5-tts-voicedesign"},
+            "mimo_tts_clone_model": {"type": "text", "category": "generation_params", "default": "mimo-v2.5-tts-voiceclone"},
+            "mimo_tts_voice_prompt": {"type": "textarea", "category": "generation_params", "default": "年轻、放松、语速偏快，像 Tom 猫那种俏皮又有点夸张的卡通感；说话轻快自然、有活力，吐字清楚，不要正式播音腔。"},
+            "custom_tts_api_url": {"type": "url", "category": "generation_params", "default": "http://localhost:9880/"},
+            "custom_tts_api_speaker": {"type": "text", "category": "generation_params", "default": "TOM女"},
+            "custom_tts_api_speed": {"type": "text", "category": "generation_params", "default": "1"},
+            "custom_tts_api_novasr": {"type": "text", "category": "generation_params", "default": "1"},
+
             # Parallel Generation Configuration
-            "enable_parallel_generation": {"type": "boolean", "category": "generation_params", "default": "false"},
+            "enable_parallel_generation": {"type": "boolean", "category": "generation_params", "default": "true"},
             "parallel_slides_count": {"type": "number", "category": "generation_params", "default": "3"},
+            "enable_per_slide_creative_guidance": {"type": "boolean", "category": "generation_params", "default": "true"},
             
             "tavily_api_key": {"type": "password", "category": "generation_params"},
+            "tavily_base_url": {"type": "url", "category": "generation_params", "default": "https://api.tavily.com"},
             "tavily_max_results": {"type": "number", "category": "generation_params", "default": "10"},
             "tavily_search_depth": {"type": "select", "category": "generation_params", "default": "advanced"},
 
@@ -105,7 +121,13 @@ class ConfigService:
             "research_max_content_length": {"type": "number", "category": "generation_params", "default": "5000"},
             "research_extraction_timeout": {"type": "number", "category": "generation_params", "default": "30"},
 
-            "apryse_license_key": {"type": "password", "category": "generation_params"},
+            "enable_apryse_pptx_export": {
+                "type": "boolean",
+                "category": "generation_params",
+                "default": "false",
+                "admin_only": True,
+            },
+            "apryse_license_key": {"type": "password", "category": "generation_params", "admin_only": True},
             
             # Feature Flags
             "enable_network_mode": {"type": "boolean", "category": "feature_flags", "default": "true"},
@@ -122,7 +144,7 @@ class ConfigService:
             "base_url": {"type": "url", "category": "app_config", "default": "http://localhost:8000"},
             "reload": {"type": "boolean", "category": "app_config", "default": "true"},
             "secret_key": {"type": "password", "category": "app_config", "default": "your-very-secure-secret-key"},
-            "access_token_expire_minutes": {"type": "number", "category": "app_config", "default": "30"},
+            "access_token_expire_minutes": {"type": "number", "category": "app_config", "default": "20160"},  # 2 weeks
             "max_file_size": {"type": "number", "category": "app_config", "default": "10485760"},
             "upload_dir": {"type": "text", "category": "app_config", "default": "uploads"},
             "cache_ttl": {"type": "number", "category": "app_config", "default": "3600"},
@@ -152,7 +174,7 @@ class ConfigService:
                 "type": "text",
                 "category": "image_service",
                 # provider => list of allowed WxH strings, single-line JSON to keep .env tidy
-                "default": "{\"dalle\":[\"1792x1024\",\"1024x1792\",\"1024x1024\"],\"openai_image\":[\"1536x1024\",\"1024x1536\",\"1024x1024\"],\"siliconflow\":[\"1024x1024\",\"1344x768\",\"768x1344\"],\"gemini\":[\"1024x1024\",\"1344x768\",\"768x1344\"],\"pollinations\":[\"1024x1024\",\"1280x720\",\"720x1280\"]}"
+                "default": "{\"dalle\":[\"1792x1024\",\"1024x1792\",\"1024x1024\"],\"openai_image\":[\"1536x1024\",\"1024x1536\",\"1024x1024\"],\"siliconflow\":[\"1024x1024\",\"1024x2048\",\"1536x1024\",\"2048x1152\",\"1152x2048\"],\"gemini\":[\"1024x1024\",\"1344x768\",\"768x1344\"],\"pollinations\":[\"1024x1024\",\"1344x768\",\"768x1344\",\"1536x1024\",\"1024x1536\"]}"
             },
 
             # Global Image Configuration
@@ -165,15 +187,15 @@ class ConfigService:
             "siliconflow_api_key": {"type": "password", "category": "image_service"},
             "default_ai_image_provider": {"type": "select", "category": "image_service", "default": "dalle"},
 
-            # Pollinations Configuration
-            "pollinations_api_token": {"type": "password", "category": "image_service"},
-            "pollinations_referrer": {"type": "text", "category": "image_service"},
-            "pollinations_model": {"type": "select", "category": "image_service", "default": "flux"},
+            # Pollinations Image Generation Configuration
+            "pollinations_api_key": {"type": "password", "category": "image_service"},
+            "pollinations_api_base": {"type": "url", "category": "image_service", "default": "https://gen.pollinations.ai"},
+            "pollinations_model": {"type": "text", "category": "image_service", "default": "flux"},
+            "pollinations_negative_prompt": {"type": "text", "category": "image_service", "default": "worst quality, blurry"},
             "pollinations_enhance": {"type": "boolean", "category": "image_service", "default": "false"},
             "pollinations_safe": {"type": "boolean", "category": "image_service", "default": "false"},
-            "pollinations_nologo": {"type": "boolean", "category": "image_service", "default": "false"},
-            "pollinations_private": {"type": "boolean", "category": "image_service", "default": "false"},
-            "pollinations_transparent": {"type": "boolean", "category": "image_service", "default": "false"},
+
+
 
             # Gemini Image Generation Configuration
             "gemini_image_api_key": {"type": "password", "category": "image_service"},
@@ -240,7 +262,24 @@ class ConfigService:
                 config[key] = value
         
         return config
-    
+
+    def _set_env_key_in_place(self, env_key: str, value: str) -> None:
+        """Apply python-dotenv key semantics without replacing the .env inode."""
+        with self.env_path.open("r+b") as env_file:
+            original_content = env_file.read()
+
+            with tempfile.TemporaryDirectory(prefix="landppt-dotenv-") as temp_dir:
+                staged_path = Path(temp_dir) / ".env"
+                staged_path.write_bytes(original_content)
+                set_key(str(staged_path), env_key, value, quote_mode="never")
+                updated_content = staged_path.read_bytes()
+
+            env_file.seek(0)
+            env_file.write(updated_content)
+            env_file.truncate()
+            env_file.flush()
+            os.fsync(env_file.fileno())
+
     def update_config(self, config: Dict[str, Any]) -> bool:
         """Update configuration values"""
         try:
@@ -254,8 +293,8 @@ class ConfigService:
                     else:
                         value = str(value)
 
-                    # Update .env file (without quotes)
-                    set_key(self.env_file, env_key, value, quote_mode="never")
+                    # Preserve the inode so updates work through a bind-mounted file.
+                    self._set_env_key_in_place(env_key, value)
 
                     # Update current environment
                     os.environ[env_key] = value
@@ -347,36 +386,6 @@ class ConfigService:
             # 重新加载环境变量配置
             image_config._load_env_config()
 
-            # 同时更新Pollinations特定配置
-            current_config = self.get_all_config()
-            pollinations_updates = {}
-
-            # 映射配置项到Pollinations配置
-            if 'pollinations_api_token' in current_config:
-                pollinations_updates['api_token'] = current_config['pollinations_api_token']
-            if 'pollinations_referrer' in current_config:
-                pollinations_updates['referrer'] = current_config['pollinations_referrer']
-            if 'pollinations_model' in current_config:
-                pollinations_updates['model'] = current_config['pollinations_model']
-            if 'pollinations_enhance' in current_config:
-                value = current_config['pollinations_enhance']
-                pollinations_updates['default_enhance'] = value if isinstance(value, bool) else str(value).lower() == 'true'
-            if 'pollinations_safe' in current_config:
-                value = current_config['pollinations_safe']
-                pollinations_updates['default_safe'] = value if isinstance(value, bool) else str(value).lower() == 'true'
-            if 'pollinations_nologo' in current_config:
-                value = current_config['pollinations_nologo']
-                pollinations_updates['default_nologo'] = value if isinstance(value, bool) else str(value).lower() == 'true'
-            if 'pollinations_private' in current_config:
-                value = current_config['pollinations_private']
-                pollinations_updates['default_private'] = value if isinstance(value, bool) else str(value).lower() == 'true'
-            if 'pollinations_transparent' in current_config:
-                value = current_config['pollinations_transparent']
-                pollinations_updates['default_transparent'] = value if isinstance(value, bool) else str(value).lower() == 'true'
-
-            # 如果有Pollinations配置更新，应用它们
-            if pollinations_updates:
-                image_config.update_config({'pollinations': pollinations_updates})
 
             # 更新Gemini图片生成配置
             gemini_updates = {}

@@ -1,5 +1,6 @@
 <!DOCTYPE html>
 <html lang="zh-CN">
+
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -7,6 +8,9 @@
     <link rel="icon" type="image/x-icon" href="/static/images/favicon.ico">
     <link rel="alternate icon" href="/favicon.ico">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+    <link rel="stylesheet" href="/static/css/shared/site_notice.css">
+    <link rel="stylesheet" href="/static/css/shared/notify.css">
+    <link rel="stylesheet" href="/static/css/shared/notification_center.css">
     <style>
         @import url('https://fonts.loli.net/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
 
@@ -63,7 +67,7 @@
             position: relative;
             overflow-x: hidden;
         }
-        
+
         .container {
             max-width: 1400px;
             margin: 0 auto;
@@ -98,7 +102,7 @@
             font-weight: 500;
             opacity: 0.9;
         }
-        
+
         .nav {
             display: flex;
             justify-content: space-between;
@@ -140,7 +144,11 @@
         .nav-user a {
             padding: var(--spacing-sm) var(--spacing-sm);
             font-size: 0.85rem;
-            background: rgba(255,255,255,0.15);
+        }
+
+        .nav a.nav-admin {
+            background: rgba(239, 68, 68, 0.1);
+            border-color: rgba(239, 68, 68, 0.3);
         }
 
         .nav a:hover {
@@ -151,14 +159,10 @@
             box-shadow: var(--shadow-soft);
         }
 
-        .nav a:hover::before {
-            left: 0;
-        }
-
         .nav a:active {
             transform: translateY(-2px) scale(0.98);
         }
-        
+
         .main-content {
             background: var(--surface);
             border: 1px solid var(--glass-border);
@@ -177,7 +181,7 @@
             left: 0;
             right: 0;
             height: 1px;
-            background: linear-gradient(90deg, transparent, rgba(0,0,0,0.08), transparent);
+            background: linear-gradient(90deg, transparent, rgba(0, 0, 0, 0.08), transparent);
         }
 
         .footer {
@@ -191,7 +195,32 @@
             border-radius: var(--border-radius-lg);
             box-shadow: var(--shadow-soft);
         }
-        
+
+        .footer-links {
+            display: inline-flex;
+            align-items: center;
+            gap: 10px;
+            margin-left: 6px;
+        }
+
+        .footer-link {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            color: inherit;
+            text-decoration: none;
+            transition: transform 0.2s ease, opacity 0.2s ease;
+        }
+
+        .footer-link:hover {
+            transform: translateY(-1px);
+            opacity: 1;
+        }
+
+        .footer-link.is-hidden {
+            display: none;
+        }
+
         .form-group {
             margin-bottom: var(--spacing-xl);
         }
@@ -224,10 +253,8 @@
         .form-group textarea:focus,
         .form-group select:focus {
             outline: none;
-            border-color: rgba(102, 126, 234, 0.5);
-            box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
-            transform: translateY(-2px);
-            background: rgba(255, 255, 255, 0.4);
+            border-color: var(--ink-strong);
+            box-shadow: 0 0 0 3px rgba(17, 17, 17, 0.08);
         }
 
         .form-group input::placeholder,
@@ -235,32 +262,32 @@
             color: var(--text-muted);
             opacity: 0.8;
         }
-        
+
         .alert {
             padding: 15px;
             margin-bottom: 20px;
             border-radius: 6px;
             border-left: 4px solid;
         }
-        
+
         .alert-success {
             background: #d4edda;
             border-color: #27ae60;
             color: #155724;
         }
-        
+
         .alert-error {
             background: #f8d7da;
             border-color: #e74c3c;
             color: #721c24;
         }
-        
+
         .alert-info {
             background: #d1ecf1;
             border-color: #3498db;
             color: #0c5460;
         }
-        
+
         .card {
             background: var(--surface);
             border: 1px solid var(--border-color);
@@ -284,31 +311,6 @@
             grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
         }
 
-        /* Floating Action Button */
-        .fab {
-            position: fixed;
-            bottom: var(--spacing-xl);
-            right: var(--spacing-xl);
-            width: 60px;
-            height: 60px;
-            background: var(--surface-contrast);
-            border-radius: 50%;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            color: white;
-            font-size: 1.5rem;
-            box-shadow: 0 8px 25px rgba(0, 0, 0, 0.18);
-            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-            cursor: pointer;
-            z-index: 1000;
-        }
-
-        .fab:hover {
-            transform: scale(1.05) translateY(-2px);
-            box-shadow: 0 12px 35px rgba(0, 0, 0, 0.22);
-        }
-
         .btn {
             display: inline-flex;
             align-items: center;
@@ -318,6 +320,9 @@
             border: 1px solid var(--border-color);
             background: var(--surface);
             color: var(--ink);
+            font-family: inherit;
+            font-size: 1rem;
+            line-height: 1.6;
             font-weight: 600;
             cursor: pointer;
             transition: all 0.2s ease;
@@ -368,22 +373,10 @@
             font-size: 0.85rem;
         }
 
-        /* Override fab styles for footer github icon */
         .footer-github-icon {
-            position: static !important;
-            width: auto !important;
-            height: auto !important;
-            background: none !important;
-            border-radius: 0 !important;
-            box-shadow: none !important;
-            transform: none !important;
-            z-index: auto !important;
-            bottom: auto !important;
-            right: auto !important;
-            display: inline !important;
-            color: var(--glass-text);
+            color: inherit;
         }
-        
+
         @media (max-width: 1200px) {
             .nav {
                 flex-direction: column;
@@ -439,8 +432,11 @@
     </style>
     {% block extra_css %}{% endblock %}
 </head>
+
 <body>
+    {% set current_user = user if user else request.state.user %}
     <div class="container">
+        <div id="globalSiteNotice" class="site-notice site-notice--hidden" hidden></div>
         <header class="header">
             <h1>
                 <span style="display: inline-flex; align-items: center; gap: 12px;">
@@ -452,7 +448,7 @@
             <nav class="nav">
                 <div class="nav-main">
                     <a href="/home"><i class="fas fa-home"></i> 首页</a>
-                    <a href="/scenarios"><i class="fas fa-list-alt"></i> 场景选择</a>
+                    <a href="/create"><i class="fas fa-wand-magic-sparkles"></i> 创建 PPT</a>
                     <a href="/projects"><i class="fas fa-chart-bar"></i> 项目列表</a>
                     <a href="/dashboard"><i class="fas fa-tachometer-alt"></i> 项目仪表板</a>
                     <a href="/global-master-templates"><i class="fas fa-palette"></i> 模板管理</a>
@@ -461,27 +457,90 @@
                     <!-- <a href="/docs"><i class="fas fa-book"></i> API文档</a> -->
                 </div>
 
+                {% if current_user %}
                 <div class="nav-user">
+                    <a href="#" class="nav-bell" id="navNotificationBell" title="通知" role="button"
+                        aria-haspopup="dialog" aria-expanded="false">
+                        <i class="fas fa-bell"></i> 通知
+                        <span class="nav-bell-badge" id="navNotificationBadge" hidden>0</span>
+                    </a>
+                    {% if current_user and credits_enabled %}
+                    <a href="/credits" title="我的积分">
+                        <i class="fas fa-coins"></i> 积分
+                    </a>
+                    {% endif %}
+                    {% if current_user and current_user.is_admin %}
+                    <a href="/admin" title="管理后台" class="nav-admin">
+                        <i class="fas fa-cog"></i> 管理
+                    </a>
+                    {% endif %}
                     <a href="/auth/profile" title="个人资料">
                         <i class="fas fa-user"></i> 个人资料
                     </a>
-                    <a href="/auth/logout" title="退出登录"
-                       onclick="return confirm('确定要退出登录吗？')">
+                    <a href="/auth/logout" title="退出登录" id="navLogoutLink">
                         <i class="fas fa-sign-out-alt"></i> 退出
                     </a>
                 </div>
+                {% else %}
+                <div class="nav-user">
+                    <a href="/auth/login" title="登录">
+                        <i class="fas fa-sign-in-alt"></i> 登录
+                    </a>
+                    <a href="/auth/login?tab=register" title="注册">
+                        <i class="fas fa-user-plus"></i> 注册
+                    </a>
+                </div>
+                {% endif %}
             </nav>
+
         </header>
-        
+
         <main class="main-content">
             {% block content %}{% endblock %}
         </main>
-        
+
         <footer class="footer">
-            <p>&copy; 2025 LandPPT(v0.1.6) - AI PPT Generator. <a href="https://github.com/sligter/LandPPT" target="_blank" style="color: inherit; text-decoration: none;"><i class="fab fa-github footer-github-icon" style="margin-left: 6px;"></i></a></p>
+            <p>&copy; 2026 LandPPT(v0.3.2) - AI PPT Generator.
+                <span class="footer-links">
+                    <a href="https://github.com/sligter/LandPPT" target="_blank" class="footer-link" title="GitHub"
+                        aria-label="GitHub">
+                        <i class="fab fa-github footer-github-icon"></i>
+                    </a>
+                    <a href="/sponsors" id="footerSponsorLink" class="footer-link is-hidden" title="赞助感谢页"
+                        aria-label="赞助感谢页">
+                        <i class="fas fa-heart"></i>
+                    </a>
+                    <a href="mailto:support@landppt.com" title="商务合作" class="footer-link" aria-label="商务合作">
+                        <i class="fas fa-envelope"></i>
+                    </a>
+                </span>
+            </p>
         </footer>
     </div>
-    
+
+    <script src="/static/js/shared/notify.js?v=20260726"></script>
+    <script src="/static/js/shared/site_notice.js?v=20260322"></script>
+    <script src="/static/js/shared/notification_center.js?v=20260727"></script>
+    <script>
+        window.SiteNotice?.loadPublicSettings({
+            noticeContainer: 'globalSiteNotice',
+            sponsorLink: 'footerSponsorLink',
+        });
+        {% if current_user %}
+        window.NotificationCenter?.mount({
+            bell: 'navNotificationBell',
+            badge: 'navNotificationBadge',
+        });
+        {% endif %}
+        document.getElementById('navLogoutLink')?.addEventListener('click', async (e) => {
+            e.preventDefault();
+            const href = e.currentTarget.href;
+            if (await Notify.confirm('确定要退出登录吗？')) {
+                window.location.href = href;
+            }
+        });
+    </script>
     {% block extra_js %}{% endblock %}
 </body>
+
 </html>
